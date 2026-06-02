@@ -460,20 +460,22 @@ Startup logs are written to `/var/log/traffic/node*-bootstrap.log` on each VM.
 
 ### Progressive Retraining Strategy
 
-The system uses a **progressive retraining** approach — models re-train as soon as enough new data arrives, not after all ~3.8M rows finish replaying:
+The system uses a **progressive retraining** approach — models re-train on every Airflow schedule cycle as long as fresh Silver data is detected, not after a fixed row-count threshold:
 
-- `RETRAIN_MIN_US_ROWS`: minimum US replay rows before H2O retraining runs (cloud default: **100,000** — changed from 3,000,000 to enable continuous retraining while replay is still in progress)
-- `RETRAIN_ALLOW_IF_COUNT_UNAVAILABLE`: set to `false` to skip retrain when row count cannot be read
-- `RETRAIN_ROWCOUNT_ENDPOINT`: API endpoint used to fetch replay row counts (default: `http://10.128.0.4:8000/api/v1/pipeline/replay-health`)
+- **Silver freshness gate**: Before each retrain, Node 3 runs `gcloud storage rsync` to pull the latest Silver features from GCS. If new objects exist since the last run, Spark processes them to Gold and H2O AutoML retrains. If no new data arrived, the run exits cleanly (no wasted compute).
+- `RETRAIN_MIN_US_ROWS`: **Set to 0 by default** (gate disabled). The row-count threshold proved to be an anti-pattern — during replay, data streams in continuously, so checking for *new* Silver objects is more accurate than checking for a minimum row count. If you want to re-enable, set to a positive integer in `.env.cloud`.
+- `RETRAIN_ALLOW_IF_COUNT_UNAVAILABLE`: set to `true` to continue retrain even if the row-count API is unreachable.
 
 **How it works:**
-1. Node 2 streams US post-2020 data through Kafka → Flink → PostgreSQL `traffic_risk_predictions`
-2. Airflow DAG `model_retrain_hourly` runs every 15 minutes (`*/15 * * * *`)
-3. Node 3 checks `replay-health` API — if rows ≥ `RETRAIN_MIN_US_ROWS`, Spark processes Silver → Gold, then H2O AutoML retrains
-4. Best model is registered in MLflow Registry → Flink auto-loads `traffic-risk-model/latest`
-5. As more rows accumulate, each subsequent retrain has more data → model improves over time
+1. Node 2 streams US post-2020 data through Kafka → Flink → PostgreSQL `traffic_risk_predictions` + Silver JSONL to GCS
+2. Airflow DAG `model_retrain_hourly` triggers every 15 minutes (`*/15 * * * *`)
+3. Node 3 acquires a mutex lock, then runs `gcloud storage rsync` to pull new Silver files from GCS
+4. If new Silver files exist → Spark Silver→Gold → H2O AutoML training → MLflow Model Registry update
+5. If no new Silver files → exits cleanly (no wasted compute)
+6. Flink auto-loads `traffic-risk-model/latest` on each checkpoint cycle
+7. Model quality improves as more post-2020 replay data accumulates
 
-The dashboard pipeline page reports `retrain_ready: true/false` and shows `Retrain loop: Running` when the gate passes. Set `RETRAIN_MIN_US_ROWS` in `.env.cloud` and sync to all nodes + GCS to adjust the threshold.
+The dashboard pipeline page reports `Retrain loop: Running/Finished/Failed` and shows the last run timestamp. The retrain loop auto-recovers on the next Airflow schedule if any transient failure occurs (network timeout, OOM, lock contention).
 
 ---
 
