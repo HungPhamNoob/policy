@@ -1,7 +1,5 @@
 """Prediction query service backed by PostgreSQL/PostGIS."""
 
-import math
-
 from typing import Any, Literal
 
 from fastapi import HTTPException
@@ -157,10 +155,9 @@ def _limit_full_mode_sources(
     normalized_mode: MapMode,
     limit: int,
 ) -> list[sql.Composable]:
-    """Keep full-mode queries balanced so live rows do not crowd out replay rows."""
+    """Apply the requested limit independently to each source in full mode."""
     if normalized_mode != "full" or len(selects) <= 1:
         return selects
-    per_source_limit = max(1, math.ceil(limit / len(selects)))
     return [
         sql.SQL(
             """
@@ -173,10 +170,17 @@ def _limit_full_mode_sources(
             """
         ).format(
             source_query=source_query,
-            per_source_limit=sql.Literal(per_source_limit),
+            per_source_limit=sql.Literal(limit),
         )
         for source_query in selects
     ]
+
+
+def _union_limit(normalized_mode: MapMode, source_count: int, limit: int) -> int:
+    """Return the outer result limit after each full-mode source is capped."""
+    if normalized_mode == "full" and source_count > 1:
+        return limit * source_count
+    return limit
 
 
 def mode_table_identifier(mode: str | None) -> sql.Identifier:
@@ -436,6 +440,8 @@ def _load_map_points(
         selects.append(tomtom_select)
     if not selects:
         return {"points": []}
+    union_limit = _union_limit(normalized_mode, len(selects), limit)
+    params["union_limit"] = union_limit
     selects = _limit_full_mode_sources(selects, normalized_mode, limit)
 
     union_query = sql.SQL(" UNION ALL ").join(selects)
@@ -444,7 +450,7 @@ def _load_map_points(
         SELECT *
         FROM ({union_query}) AS map_points
         ORDER BY event_time DESC NULLS LAST
-        LIMIT %(limit)s
+        LIMIT %(union_limit)s
         """
     ).format(union_query=union_query)
     try:
@@ -466,7 +472,7 @@ def _load_map_points(
             WHERE lon BETWEEN %(min_lon)s AND %(max_lon)s
               AND lat BETWEEN %(min_lat)s AND %(max_lat)s
             ORDER BY event_time DESC NULLS LAST
-            LIMIT %(limit)s
+            LIMIT %(union_limit)s
             """
         ).format(
             union_query=sql.SQL(" UNION ALL ").join(selects),
@@ -630,6 +636,7 @@ def _load_latest_predictions(
         )
     if not selects:
         return {"predictions": []}
+    union_limit = _union_limit(normalized_mode, len(selects), limit)
     selects = _limit_full_mode_sources(selects, normalized_mode, limit)
 
     query = sql.SQL(
@@ -637,10 +644,10 @@ def _load_latest_predictions(
         SELECT *
         FROM ({union_query}) AS latest_events
         ORDER BY event_time DESC NULLS LAST
-        LIMIT %(limit)s
+        LIMIT %(union_limit)s
         """
     ).format(union_query=sql.SQL(" UNION ALL ").join(selects))
-    rows = fetch_all(query, {"limit": limit})
+    rows = fetch_all(query, {"limit": limit, "union_limit": union_limit})
     for row in rows:
         if row.get("event_time"):
             row["event_time"] = row["event_time"].isoformat()

@@ -114,6 +114,67 @@ compose_cmd() {
   docker compose "$@"
 }
 
+ensure_gcloud_cli() {
+  if command -v gcloud >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Installing missing dependency for 'gcloud': google-cloud-cli tarball"
+  local installer_tgz="/tmp/google-cloud-cli-460.0.0-linux-x86_64.tar.gz"
+  curl -fsSL "https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-460.0.0-linux-x86_64.tar.gz" -o "${installer_tgz}"
+  rm -rf "${HOME}/google-cloud-sdk"
+  tar -xf "${installer_tgz}" -C "${HOME}"
+  "${HOME}/google-cloud-sdk/install.sh" --quiet
+  export PATH="${PATH}:${HOME}/google-cloud-sdk/bin"
+}
+
+sync_runtime_env_to_gcs() {
+  local gcs_env_path="${GCS_ENV_PATH:-}"
+  if [ -z "${gcs_env_path}" ] || [ ! -f "${ENV_FILE}" ]; then
+    return 0
+  fi
+  echo "Uploading ${ENV_FILE} to ${gcs_env_path} so the other nodes can refresh their runtime env."
+  gcloud storage cp "${ENV_FILE}" "${gcs_env_path}" >/dev/null
+}
+
+ensure_inter_node_ssh_access() {
+  local key_path="${FASTAPI_SSH_KEY_PATH:-}"
+  local target_user="${HUNG_SSH_USER:-runner}"
+  if [ -z "${key_path}" ] || [ ! -f "${key_path}" ]; then
+    echo "Skipping inter-node SSH authorization because ${key_path:-<unset>} is unavailable."
+    return 0
+  fi
+
+  local public_key
+  public_key="$(sudo ssh-keygen -y -f "${key_path}" 2>/dev/null || ssh-keygen -y -f "${key_path}" 2>/dev/null || true)"
+  if [ -z "${public_key}" ]; then
+    echo "Skipping inter-node SSH authorization because the public key could not be derived."
+    return 0
+  fi
+
+  local public_key_b64
+  public_key_b64="$(printf '%s' "${public_key}" | base64 -w0)"
+  local project_id="${GCP_PROJECT_ID:-big-data-group-4}"
+  local zone="${GCP_ZONE:-us-central1-a}"
+  local node_name
+  for node_name in node2-streaming node3-batch; do
+    echo "Authorizing the shared SSH key on ${node_name} for user ${target_user}."
+    gcloud compute ssh "${node_name}" \
+      --zone="${zone}" \
+      --project="${project_id}" \
+      --quiet \
+      --command="
+        set -euo pipefail
+        target_user='${target_user}'
+        target_home=\$(getent passwd \"\${target_user}\" | cut -d: -f6)
+        auth_keys=\"\${target_home}/.ssh/authorized_keys\"
+        sudo TARGET_AUTH_KEYS=\"\${auth_keys}\" TARGET_PUBLIC_KEY_B64='${public_key_b64}' python3 -c \"import base64, os; from pathlib import Path; path = Path(os.environ['TARGET_AUTH_KEYS']); public_key = base64.b64decode(os.environ['TARGET_PUBLIC_KEY_B64']).decode('utf-8'); path.parent.mkdir(parents=True, exist_ok=True); existing_text = path.read_text(encoding='utf-8') if path.exists() else ''; existing_lines = existing_text.splitlines(); updated_text = existing_text if public_key in existing_lines else existing_text + ('' if not existing_text or existing_text.endswith('\\\\n') else '\\\\n') + public_key + '\\\\n'; path.write_text(updated_text, encoding='utf-8')\"
+        sudo chown -R \"\${target_user}:\${target_user}\" \"\${target_home}/.ssh\"
+        sudo chmod 700 \"\${target_home}/.ssh\"
+        sudo chmod 600 \"\${auth_keys}\"
+      " >/dev/null
+  done
+}
+
 wait_for_postgres() {
   echo "Waiting for PostgreSQL before applying runtime index guards..."
   for attempt in $(seq 1 30); do
@@ -257,6 +318,7 @@ echo "Checking host dependencies required for offline H2O training."
 ensure_command curl curl
 ensure_command docker docker.io
 ensure_docker_compose
+ensure_gcloud_cli
 ensure_command java openjdk-17-jre-headless
 ensure_command python3 python3
 
@@ -267,6 +329,8 @@ fi
 
 echo "Starting Node 1 Docker services from the current workspace snapshot..."
 prepare_runtime_directories
+sync_runtime_env_to_gcs
+ensure_inter_node_ssh_access
 
 echo "Removing stale Node 1 containers from previous Compose project names..."
 remove_matching_node1_containers "${NODE1_CANONICAL_NAME_PATTERN}"

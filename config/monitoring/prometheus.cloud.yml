@@ -2,7 +2,7 @@
 #
 # Node topology:
 #   node1-control  (10.128.0.4 / 35.224.149.110): PostgreSQL, Airflow, MLflow, FastAPI, Prometheus, Grafana
-#   node2-streaming (10.128.0.5 / 35.225.231.57): Kafka x3, Flink, Redis, producers
+#   node2-streaming (10.128.0.9 / 34.46.107.159): Kafka x3, Flink, Redis, producers
 #   node3-batch    (10.128.0.8 / 34.63.78.147):   Spark master + 3 workers
 
 global:
@@ -32,8 +32,8 @@ scrape_configs:
       - targets:
           - http://fastapi:8000/health
           - http://mlflow:5000/health
-          - http://10.128.0.5:8081        # Flink JobManager UI
-          - http://10.128.0.5:8087        # Kafka UI
+          - http://10.128.0.9:8081        # Flink JobManager UI
+          - http://10.128.0.9:8087        # Kafka UI
           - http://10.128.0.8:8080        # Spark master UI
     relabel_configs:
       - source_labels: [__address__]
@@ -51,10 +51,10 @@ scrape_configs:
     static_configs:
       - targets:
           - postgres:5432               # PostgreSQL on node1
-          - 10.128.0.5:9092             # Kafka broker 1
-          - 10.128.0.5:9093             # Kafka broker 2
-          - 10.128.0.5:9094             # Kafka broker 3
-          - 10.128.0.5:2181             # ZooKeeper on node2
+          - 10.128.0.9:9092             # Kafka broker 1
+          - 10.128.0.9:9093             # Kafka broker 2
+          - 10.128.0.9:9094             # Kafka broker 3
+          - 10.128.0.9:2181             # ZooKeeper on node2
           - 10.128.0.8:7077             # Spark master RPC
     relabel_configs:
       - source_labels: [__address__]

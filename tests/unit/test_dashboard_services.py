@@ -9,7 +9,7 @@ if str(BACKEND_PATH) not in sys.path:
 
 from psycopg2 import sql  # noqa: E402
 
-from app.services import analytics_service, pipeline_service  # noqa: E402
+from app.services import analytics_service, pipeline_service, prediction_service  # noqa: E402
 
 
 def test_timeseries_metric_count_is_returned(monkeypatch):
@@ -117,3 +117,88 @@ def test_time_column_prefers_processed_time_over_created_at():
     )
 
     assert result == "processed_time"
+
+
+def test_replay_health_returns_exact_replay_count_and_threshold(monkeypatch):
+    monkeypatch.setattr(
+        pipeline_service,
+        "_prediction_table_names",
+        lambda: ["traffic_risk_predictions", "traffic_tomtom_incidents"],
+    )
+    monkeypatch.setattr(
+        pipeline_service,
+        "_columns_for_table",
+        lambda table_name: {"event_time"},
+    )
+    monkeypatch.setattr(
+        pipeline_service,
+        "_skip_expensive_time_scan",
+        lambda table_name, column: False,
+    )
+    monkeypatch.setattr(
+        pipeline_service,
+        "_latest_table_timestamp",
+        lambda table_name, column: datetime(2024, 1, 1, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(
+        pipeline_service,
+        "_table_row_estimate",
+        lambda table_name: 300,
+    )
+    monkeypatch.setattr(
+        pipeline_service,
+        "_exact_table_row_count",
+        lambda table_name: 2_175_600 if table_name == "traffic_risk_predictions" else 8_948,
+    )
+
+    settings = pipeline_service.get_settings()
+    monkeypatch.setattr(settings, "retrain_min_us_rows", 3_000_000)
+
+    result = pipeline_service.replay_health()
+
+    assert result["row_count"] == 2_175_600
+    assert result["total_row_count"] == 2_184_548
+    assert result["retrain_ready"] is False
+    assert result["sources"][0]["row_count"] == 2_175_600
+    assert result["sources"][1]["row_count"] == 8_948
+
+
+def test_full_map_uses_limit_per_source(monkeypatch):
+    captured_params = {}
+
+    monkeypatch.setattr(prediction_service, "_table_exists", lambda table_name: True)
+    monkeypatch.setattr(
+        prediction_service,
+        "fetch_all",
+        lambda query, params=None: captured_params.update(params or {}) or [],
+    )
+
+    result = prediction_service._load_map_points(
+        bbox=None,
+        min_risk=0.0,
+        start_time=None,
+        end_time=None,
+        limit=5_000,
+        normalized_mode="full",
+    )
+
+    assert result == {"points": []}
+    assert captured_params["limit"] == 5_000
+    assert captured_params["union_limit"] == 10_000
+
+
+def test_full_latest_uses_limit_per_source(monkeypatch):
+    captured_params = {}
+
+    monkeypatch.setattr(prediction_service, "_table_exists", lambda table_name: True)
+    monkeypatch.setattr(
+        prediction_service,
+        "fetch_all",
+        lambda query, params=None: captured_params.update(params or {}) or [],
+    )
+
+    result = prediction_service._load_latest_predictions(100, "full")
+
+    assert result == {"predictions": []}
+    assert captured_params["limit"] == 100
+    assert captured_params["union_limit"] == 200

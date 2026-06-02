@@ -26,6 +26,11 @@ echo "Environment file: ${ENV_FILE}"
 
 cd "${PROJECT_ROOT}"
 
+if [ -x "${PROJECT_ROOT}/scripts/gcp/sync-env-from-gcs.sh" ]; then
+  ENV_FILE="${ENV_FILE}" PROJECT_ROOT="${PROJECT_ROOT}" \
+    bash "${PROJECT_ROOT}/scripts/gcp/sync-env-from-gcs.sh" "${ENV_FILE}" || true
+fi
+
 if [ -f "${ENV_FILE}" ]; then
   set -a
   . "${ENV_FILE}"
@@ -75,6 +80,19 @@ compose_cmd() {
   fi
   ensure_docker_compose
   COMPOSE_PROJECT_NAME="${NODE2_COMPOSE_PROJECT_NAME}" docker compose "$@"
+}
+
+ensure_gcloud_cli() {
+  if command -v gcloud >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Installing missing dependency for 'gcloud': google-cloud-cli tarball"
+  local installer_tgz="/tmp/google-cloud-cli-460.0.0-linux-x86_64.tar.gz"
+  curl -fsSL "https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-460.0.0-linux-x86_64.tar.gz" -o "${installer_tgz}"
+  rm -rf "${HOME}/google-cloud-sdk"
+  tar -xf "${installer_tgz}" -C "${HOME}"
+  "${HOME}/google-cloud-sdk/install.sh" --quiet
+  export PATH="${PATH}:${HOME}/google-cloud-sdk/bin"
 }
 
 compute_us_replay_start_row() {
@@ -255,6 +273,7 @@ cleanup_node2_disk_pressure() {
 echo "Checking host dependencies required for Node 2 services."
 ensure_command docker docker.io
 ensure_docker_compose
+ensure_gcloud_cli
 
 echo "Starting Kafka, Redis, TomTom, and Flink streaming services..."
 cleanup_node2_disk_pressure

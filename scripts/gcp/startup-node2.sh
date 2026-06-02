@@ -66,6 +66,30 @@ echo "Preparing directories..."
 mkdir -p /opt/traffic
 chmod 775 /opt/traffic
 
+REPO_URL="${REPO_URL:-https://github.com/HungPhamNoob/traffic-risk-assessment.git}"
+if [ ! -d /opt/traffic/.git ]; then
+  echo "Cloning the latest repository snapshot into /opt/traffic."
+  rm -rf /opt/traffic
+  git clone "${REPO_URL}" /opt/traffic
+else
+  echo "Refreshing /opt/traffic from ${REPO_URL}."
+  cd /opt/traffic
+  git config --global --add safe.directory /opt/traffic 2>/dev/null || true
+  git fetch --prune origin || true
+  git pull --ff-only origin main || true
+fi
+
+GCS_ENV_PATH="${GCS_ENV_PATH:-gs://big-data-group-4-bronze/env/.env.cloud}"
+if [ -f /opt/traffic/.env.cloud ]; then
+  detected_gcs_env_path="$(awk -F= '/^GCS_ENV_PATH=/{print $2; exit}' /opt/traffic/.env.cloud 2>/dev/null || true)"
+  if [ -n "${detected_gcs_env_path}" ]; then
+    GCS_ENV_PATH="${detected_gcs_env_path}"
+  fi
+fi
+echo "Refreshing runtime env from ${GCS_ENV_PATH} when available."
+gcloud storage cp "${GCS_ENV_PATH}" /opt/traffic/.env.cloud >/dev/null 2>&1 || true
+cp /opt/traffic/.env.cloud /opt/traffic/.env 2>/dev/null || true
+
 if ! command -v uv &> /dev/null; then
   echo "Installing uv for producer and streaming worker scripts..."
   curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
@@ -73,9 +97,24 @@ fi
 
 # Configure firewall for internal communication
 echo "Configuring internal ports..."
-# Kafka: 9092, Flink: 8081/6123, Redis: 6379, Schema Registry: 8081
+# SSH: 22, Kafka: 9092, Flink: 8081/6123, Redis: 6379, Schema Registry: 8081
+ufw allow 22/tcp 2>/dev/null || true
 ufw allow 9092/tcp 2>/dev/null || true
 ufw allow 8081/tcp 2>/dev/null || true
 ufw allow 6379/tcp 2>/dev/null || true
+
+AUTO_START_NODE_SERVICES="${AUTO_START_NODE_SERVICES:-true}"
+STARTUP_LOG_DIR="/var/log/traffic"
+
+if [ "${AUTO_START_NODE_SERVICES}" = "true" ]; then
+  if [ -f /opt/traffic/.env.cloud ] && [ -x /opt/traffic/scripts/gcp/run-node2.sh ]; then
+    echo "Starting Node 2 services using run-node2.sh."
+    mkdir -p "${STARTUP_LOG_DIR}"
+    nohup bash -c "cd /opt/traffic && bash scripts/gcp/run-node2.sh" \
+      >"${STARTUP_LOG_DIR}/node2-bootstrap.log" 2>&1 &
+  else
+    echo "Skipping Node 2 service bootstrap (missing /opt/traffic/.env.cloud or run-node2.sh)."
+  fi
+fi
 
 echo "Node 2 startup completed at $(date)"

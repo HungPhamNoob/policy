@@ -65,6 +65,30 @@ echo "Preparing /opt/traffic directory..."
 mkdir -p /opt/traffic
 chmod 775 /opt/traffic
 
+REPO_URL="${REPO_URL:-https://github.com/HungPhamNoob/traffic-risk-assessment.git}"
+if [ ! -d /opt/traffic/.git ]; then
+  echo "Cloning the latest repository snapshot into /opt/traffic."
+  rm -rf /opt/traffic
+  git clone "${REPO_URL}" /opt/traffic
+else
+  echo "Refreshing /opt/traffic from ${REPO_URL}."
+  cd /opt/traffic
+  git config --global --add safe.directory /opt/traffic 2>/dev/null || true
+  git fetch --prune origin || true
+  git pull --ff-only origin main || true
+fi
+
+GCS_ENV_PATH="${GCS_ENV_PATH:-gs://big-data-group-4-bronze/env/.env.cloud}"
+if [ -f /opt/traffic/.env.cloud ]; then
+  detected_gcs_env_path="$(awk -F= '/^GCS_ENV_PATH=/{print $2; exit}' /opt/traffic/.env.cloud 2>/dev/null || true)"
+  if [ -n "${detected_gcs_env_path}" ]; then
+    GCS_ENV_PATH="${detected_gcs_env_path}"
+  fi
+fi
+echo "Refreshing runtime env from ${GCS_ENV_PATH} when available."
+gcloud storage cp "${GCS_ENV_PATH}" /opt/traffic/.env.cloud >/dev/null 2>&1 || true
+cp /opt/traffic/.env.cloud /opt/traffic/.env 2>/dev/null || true
+
 if ! command -v uv &> /dev/null; then
   echo "Installing uv for local Python workflow checks..."
   curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
@@ -72,5 +96,19 @@ fi
 
 # Configure Docker for Artifact Registry
 gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+AUTO_START_NODE_SERVICES="${AUTO_START_NODE_SERVICES:-true}"
+STARTUP_LOG_DIR="/var/log/traffic"
+
+if [ "${AUTO_START_NODE_SERVICES}" = "true" ]; then
+  if [ -f /opt/traffic/.env.cloud ] && [ -x /opt/traffic/scripts/gcp/run-node1.sh ]; then
+    echo "Starting Node 1 services using run-node1.sh."
+    mkdir -p "${STARTUP_LOG_DIR}"
+    nohup bash -c "cd /opt/traffic && bash scripts/gcp/run-node1.sh" \
+      >"${STARTUP_LOG_DIR}/node1-bootstrap.log" 2>&1 &
+  else
+    echo "Skipping Node 1 service bootstrap (missing /opt/traffic/.env.cloud or run-node1.sh)."
+  fi
+fi
 
 echo "Node 1 startup complete."

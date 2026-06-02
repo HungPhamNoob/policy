@@ -21,7 +21,7 @@ type AnyRecord = Record<string, any>;
 
 const SERVICE_URLS: Record<string, string> = {
   kafka: "",
-  flink: "http://35.225.231.57:8081",
+  flink: "http://34.46.107.159:8081",
   spark: "http://34.63.78.147:8080",
   postgres: "",
   mlflow: "http://35.224.149.110:5000",
@@ -98,12 +98,48 @@ export default function PipelinePage() {
     : [];
   const trendSeries = (trendData?.series as AnyRecord[] | undefined) || [];
   const replaySources = (replayData?.sources as AnyRecord[] | undefined) || [];
-  const latestRetrainRun = ((retrainData?.runs as AnyRecord[] | undefined) || [])[0];
+  const rawRetrainRuns = (retrainData?.runs as AnyRecord[] | undefined) || [];
+  const latestRetrainRun = rawRetrainRuns[0];
+  const replayPredictionSource =
+    replaySources.find((source) => String(source.table) === "traffic_risk_predictions") ||
+    replaySources[0];
+  const replayRowCount = Number(
+    replayPredictionSource?.row_count ?? replayData?.row_count ?? 0
+  );
+  const retrainMinRows = Number(replayData?.retrain_min_us_rows || 0);
+  const retrainReady =
+    typeof replayData?.retrain_ready === "boolean"
+      ? replayData.retrain_ready
+      : retrainMinRows > 0
+        ? replayRowCount >= retrainMinRows
+        : true;
 
-  const retrainState = String(latestRetrainRun?.status || "unavailable");
-  const retrainDetail = latestRetrainRun?.start_time
-    ? formatVietnamTimestampLabel("Last run", latestRetrainRun.start_time)
-    : "No retrain run metadata yet";
+  const retrainState = !retrainReady
+    ? "Waiting for data"
+    : String(latestRetrainRun?.status || "unavailable");
+  const retrainDetail = !retrainReady
+    ? `US replay: ${replayRowCount.toLocaleString()} / ${retrainMinRows.toLocaleString()}`
+    : latestRetrainRun?.start_time
+      ? formatVietnamTimestampLabel("Last run", latestRetrainRun.start_time)
+      : "No retrain run metadata yet";
+  const retrainHistoryRows = !retrainReady
+    ? [
+        {
+          run_id: "retrain-data-gate",
+          run_name: "retrain_data_gate",
+          status: "WAITING_DATA",
+          start_time: null,
+          metrics: {}
+        },
+        ...rawRetrainRuns.filter(
+          (run) =>
+            !(
+              String(run.run_name || "") === "h2o_retrain_online" &&
+              String(run.status || "").toUpperCase() === "FAILED"
+            )
+        )
+      ]
+    : rawRetrainRuns;
 
   const serviceRows = [
     [
@@ -198,8 +234,12 @@ export default function PipelinePage() {
         />
         <KpiCard
           label="Prediction rows"
-          value={Number(replayData?.row_count || 0).toLocaleString()}
-          detail={statusText(replayData)}
+          value={replayRowCount.toLocaleString()}
+          detail={
+            retrainMinRows > 0
+              ? `US replay threshold: ${retrainMinRows.toLocaleString()}`
+              : statusText(replayData)
+          }
         />
         <KpiCard
           label="Model"
@@ -353,7 +393,7 @@ export default function PipelinePage() {
             </tr>
           </thead>
           <tbody>
-            {((retrainData?.runs as AnyRecord[] | undefined) || []).map((run) => (
+            {retrainHistoryRows.map((run) => (
               <tr key={run.run_id}>
                 <td className="mono">{run.run_name || run.run_id}</td>
                 <td>{run.status}</td>

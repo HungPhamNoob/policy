@@ -115,6 +115,14 @@ def _table_row_estimate(table_name: str) -> int:
     return int(row.get("row_estimate") or 0) if row else 0
 
 
+def _exact_table_row_count(table_name: str) -> int:
+    query = sql.SQL("SELECT COUNT(*)::BIGINT AS row_count FROM {table}").format(
+        table=table_identifier(table_name)
+    )
+    row = fetch_one(query) or {}
+    return int(row.get("row_count") or 0)
+
+
 def _index_valid(index_name: str) -> bool:
     row = fetch_one(
         """
@@ -375,8 +383,10 @@ def latency(metric: str, window: str = "5m") -> dict[str, Any]:
 
 def replay_health() -> dict[str, Any]:
     """Return recent replay and model-status metadata from the prediction table."""
+    settings = get_settings()
     source_health = []
     total_rows = 0
+    replay_rows = 0
     for table_name in _prediction_table_names():
         columns = _columns_for_table(table_name)
         if not columns:
@@ -390,14 +400,24 @@ def replay_health() -> dict[str, Any]:
             table_name, "event_time"
         ):
             latest_event_time = _latest_table_timestamp(table_name, "event_time")
-        row_count = _table_row_estimate(table_name)
+        row_estimate = _table_row_estimate(table_name)
+        if (
+            table_name == settings.us_prediction_table.split(".")[-1]
+            or row_estimate <= EXPENSIVE_SCAN_ROW_THRESHOLD
+        ):
+            row_count = _exact_table_row_count(table_name)
+        else:
+            row_count = row_estimate
         total_rows += row_count
+        if table_name == settings.us_prediction_table.split(".")[-1]:
+            replay_rows = row_count
 
         source_health.append(
             {
                 "table": table_name,
                 "status": "ok" if row_count else "not_enough_data",
                 "row_count": row_count,
+                "row_estimate": row_estimate,
                 "latest_event_time": (
                     latest_event_time.isoformat() if latest_event_time else None
                 ),
@@ -417,7 +437,10 @@ def replay_health() -> dict[str, Any]:
 
     return {
         "status": "ok" if total_rows else "not_enough_data",
-        "row_count": total_rows,
+        "row_count": replay_rows,
+        "total_row_count": total_rows,
+        "retrain_min_us_rows": settings.retrain_min_us_rows,
+        "retrain_ready": replay_rows >= settings.retrain_min_us_rows,
         "sources": source_health,
     }
 

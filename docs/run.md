@@ -29,7 +29,7 @@ Current VM addresses from the latest provided inventory:
 | MLflow | `http://35.224.149.110:5000` |
 | Grafana | `http://35.224.149.110:3000` |
 | Prometheus | `http://35.224.149.110:9090` |
-| Flink JobManager | `http://35.225.231.57:8081` |
+| Flink JobManager | `http://34.46.107.159:8081` |
 | Spark Master | `http://34.63.78.147:8080` |
 
 Credentials from `.env.cloud` defaults:
@@ -289,7 +289,7 @@ Then push again to `main`.
 For a real end-to-end run from a clean state, prefer the automated command:
 
 ```bash
-BRANCH=main STREAM_MAX_RECORDS=0 STREAM_THROTTLE_SECONDS=0.0 \
+BRANCH=main STREAM_MAX_RECORDS=0 STREAM_THROTTLE_SECONDS=0.002 \
 make -f makefile/gcp/Makefile full-reset-run
 ```
 
@@ -361,7 +361,7 @@ those dependencies are installed.
 ```bash
 gcloud compute ssh node2-streaming --zone=us-central1-a --project=big-data-group-4 --command='
   cd /opt/traffic &&
-  STREAM_MAX_RECORDS=900 STREAM_THROTTLE_SECONDS=0.0 bash scripts/gcp/run-node2.sh &&
+  STREAM_MAX_RECORDS=900 STREAM_THROTTLE_SECONDS=0.002 bash scripts/gcp/run-node2.sh &&
   docker compose --env-file .env.cloud -f deployment/node2-streaming/docker-compose.yaml logs --tail=120 flink-python-job
 '
 ```

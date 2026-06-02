@@ -77,7 +77,7 @@ services:
       - AIRFLOW_STREAM_HEALTH_SCHEDULE=${AIRFLOW_STREAM_HEALTH_SCHEDULE:-*/2 * * * *}
       - SSH_KEY=/run/secrets/google_compute_engine
       - HUNG_SSH_USER=${HUNG_SSH_USER:-runner}
-      - NODE2_INTERNAL_IP=${NODE2_INTERNAL_IP:-10.128.0.5}
+      - NODE2_INTERNAL_IP=${NODE2_INTERNAL_IP:-10.128.0.9}
       - NODE3_INTERNAL_IP=${NODE3_INTERNAL_IP:-10.128.0.8}
     volumes:
       - ../../orchestration/dags:/opt/airflow/dags:ro
@@ -136,7 +136,7 @@ services:
       - AIRFLOW_STREAM_HEALTH_SCHEDULE=${AIRFLOW_STREAM_HEALTH_SCHEDULE:-*/2 * * * *}
       - SSH_KEY=/run/secrets/google_compute_engine
       - HUNG_SSH_USER=${HUNG_SSH_USER:-runner}
-      - NODE2_INTERNAL_IP=${NODE2_INTERNAL_IP:-10.128.0.5}
+      - NODE2_INTERNAL_IP=${NODE2_INTERNAL_IP:-10.128.0.9}
       - NODE3_INTERNAL_IP=${NODE3_INTERNAL_IP:-10.128.0.8}
     volumes:
       - ../../orchestration/dags:/opt/airflow/dags:ro

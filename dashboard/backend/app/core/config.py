@@ -61,6 +61,10 @@ class Settings(BaseSettings):
         default="*/2 * * * *",
         alias="AIRFLOW_STREAM_HEALTH_SCHEDULE",
     )
+    retrain_min_us_rows: int = Field(
+        default=3_000_000,
+        alias="RETRAIN_MIN_US_ROWS",
+    )
     pipeline_reset_script: str = Field(
         default="/opt/traffic/scripts/gcp/full-cloud-realtime-reset-run.sh",
         alias="PIPELINE_RESET_SCRIPT",

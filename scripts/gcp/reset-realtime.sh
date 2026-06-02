@@ -35,7 +35,7 @@ RUN_DIR="${LOG_DIR}/${TIMESTAMP}"
 RESET_LOG="${RUN_DIR}/reset-realtime.log"
 
 NODE1_IP="${NODE1_IP:-35.224.149.110}"
-NODE2_IP="${NODE2_IP:-35.225.231.57}"
+NODE2_IP="${NODE2_IP:-34.46.107.159}"
 NODE3_IP="${NODE3_IP:-34.63.78.147}"
 SSH_KEY="${SSH_KEY:-~/.ssh/hung_vm_key}"
 SSH_USER="${SSH_USER:-${HUNG_SSH_USER:-$(whoami)}}"

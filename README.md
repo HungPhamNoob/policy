@@ -97,7 +97,7 @@ This repository implements the **complete end-to-end data and ML pipeline**:
 | Node | Internal IP | External IP | Role | Key Services |
 |---|---|---|---|---|
 | `node1-control` | 10.128.0.4 | 35.224.149.110 | Control Plane | PostgreSQL/PostGIS, Airflow, MLflow, FastAPI, Next.js Dashboard, Prometheus, Grafana |
-| `node2-streaming` | 10.128.0.5 | 35.225.231.57 | Streaming Plane | Kafka, Flink JobManager, Redis, US replay & TomTom producers |
+| `node2-streaming` | 10.128.0.9 | 34.46.107.159 | Streaming Plane | Kafka, Flink JobManager, Redis, US replay & TomTom producers |
 | `node3-batch` | 10.128.0.8 | 34.63.78.147 | Batch Plane | Spark Master/Worker, H2O AutoML retraining |
 
 ### End-to-End Data Flow
@@ -203,7 +203,7 @@ Key findings that shaped modeling decisions:
 | **Orchestration** | Apache Airflow |
 | **Monitoring** | Prometheus, Grafana, Blackbox Exporter |
 | **Infrastructure** | Docker Compose, Google Compute Engine, Google Cloud Storage |
-| **CI/CD** | GitHub Actions |
+| **Deployment** | Manual Git + `gcloud` sync, VM startup scripts, Docker Compose |
 | **Language** | Python 3.10+ |
 
 ---
@@ -381,6 +381,28 @@ make -f makefile/gcp/Makefile collect-metrics
 
 Results are saved to `logs/cloud_runs/<run-id>/service-checks.md`.
 
+### Manual Update Flow (no CI/CD)
+
+This repository is designed to be updated directly onto the 3 VMs without a CI/CD pipeline:
+
+```bash
+# 1) update the shared cloud env file
+gcloud storage cp .env.cloud gs://big-data-group-4-bronze/env/.env.cloud
+
+# 2) update the control plane
+gcloud compute ssh node1-control --zone=us-central1-a --project=big-data-group-4 \
+  --command='cd /opt/traffic && git pull --ff-only origin main && bash scripts/gcp/run-node1.sh'
+
+# 3) update streaming and batch nodes
+gcloud compute ssh node2-streaming --zone=us-central1-a --project=big-data-group-4 \
+  --command='cd /opt/traffic && git pull --ff-only origin main && bash scripts/gcp/run-node2.sh'
+
+gcloud compute ssh node3-batch --zone=us-central1-a --project=big-data-group-4 \
+  --command='cd /opt/traffic && git pull --ff-only origin main && bash scripts/gcp/run-node3.sh'
+```
+
+`run-node1.sh` republishes the active `.env.cloud` to GCS and repairs inter-node SSH access for Node 2 and Node 3. `run-node2.sh` and `run-node3.sh` refresh their local `.env.cloud` from GCS before starting services, so the runtime config does not drift across VMs.
+
 ---
 
 ## 🔧 Cloud Operations
@@ -399,6 +421,10 @@ gcloud compute ssh node2-streaming --zone=us-central1-a --project=big-data-group
 # Node 3 - Batch plane
 gcloud compute ssh node3-batch --zone=us-central1-a --project=big-data-group-4 \
   --command='cd /opt/traffic && git pull --ff-only origin main && NODE3_WAIT_FOR_SILVER_SECONDS=600 bash scripts/gcp/run-node3.sh'
+
+# Node 3 - Spark only (let Airflow trigger retraining)
+gcloud compute ssh node3-batch --zone=us-central1-a --project=big-data-group-4 \
+  --command='cd /opt/traffic && git pull --ff-only origin main && NODE3_RUN_BATCH_PIPELINE=false bash scripts/gcp/run-node3.sh'
 ```
 
 ### Operational Commands
@@ -408,6 +434,41 @@ make -f makefile/gcp/Makefile status              # Check all node statuses
 make -f makefile/gcp/Makefile kafka-topic-check    # Inspect Kafka topics
 make -f makefile/gcp/Makefile reset-realtime       # Reset realtime pipeline only
 ```
+
+### Always-on Mode (auto-start on VM boot)
+
+Each VM can auto-start its services as soon as it boots, so the dashboard stays online
+even if your laptop is off. The startup scripts in `scripts/gcp/startup-node*.sh` now:
+
+1. refresh `/opt/traffic` from GitHub,
+2. refresh `.env.cloud` from `gs://big-data-group-4-bronze/env/.env.cloud`,
+3. launch the corresponding `run-node*.sh` script.
+
+```bash
+# Attach startup scripts to the VMs (run from your local machine)
+gcloud compute instances add-metadata node1-control --zone=us-central1-a --project=big-data-group-4 \
+  --metadata-from-file startup-script=scripts/gcp/startup-node1.sh
+
+gcloud compute instances add-metadata node2-streaming --zone=us-central1-a --project=big-data-group-4 \
+  --metadata-from-file startup-script=scripts/gcp/startup-node2.sh
+
+gcloud compute instances add-metadata node3-batch --zone=us-central1-a --project=big-data-group-4 \
+  --metadata-from-file startup-script=scripts/gcp/startup-node3.sh
+```
+
+Startup logs are written to `/var/log/traffic/node*-bootstrap.log` on each VM.
+
+### Retrain Guardrails (avoid early retrain)
+
+Online retraining can be gated until enough replay rows are available:
+
+- `RETRAIN_MIN_US_ROWS`: minimum US replay rows before H2O retraining runs (cloud default: 3,000,000 when `ENV=cloud`)
+- `RETRAIN_ALLOW_IF_COUNT_UNAVAILABLE`: set to `false` to skip retrain when row count cannot be read
+- `RETRAIN_ROWCOUNT_ENDPOINT`: API endpoint used to fetch replay row counts
+
+The dashboard pipeline page reads the exact replay row count and reports `Waiting for data` until the replay table reaches the configured threshold.
+
+Set these in `.env.cloud` on Node 3 if you want to override defaults.
 
 ---
 
@@ -424,9 +485,9 @@ make -f makefile/gcp/Makefile reset-realtime       # Reset realtime pipeline onl
 | **Prometheus** | http://35.224.149.110:9090 | node1 | — |
 | **Grafana** | http://35.224.149.110:3000 | node1 | admin / admin |
 | **Blackbox Exporter** | http://35.224.149.110:9115 | node1 | — |
-| **PostgreSQL** | 35.224.149.110:5432 | node1 | capstone / 123 / capstone_db |
-| **Flink JobManager UI** | http://35.225.231.57:8081 | node2 | — |
-| **Kafka Broker** | 35.225.231.57:9092 | node2 | — |
+| **PostgreSQL** | 35.224.149.110:5432 | node1 | see `.env.cloud` |
+| **Flink JobManager UI** | http://34.46.107.159:8081 | node2 | — |
+| **Kafka Broker** | 34.46.107.159:9092 | node2 | — |
 | **Spark Master UI** | http://34.63.78.147:8080 | node3 | — |
 
 ---

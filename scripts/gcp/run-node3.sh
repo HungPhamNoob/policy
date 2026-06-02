@@ -34,12 +34,13 @@ cleanup_node3_temp() {
 
 release_node3_lock() {
   if [ "${NODE3_LOCK_OWNED}" -eq 1 ]; then
-    rm -rf "${NODE3_LOCK_DIR}" 2>/dev/null || true
+    rm -rf "${NODE3_LOCK_DIR}" 2>/dev/null || sudo rm -rf "${NODE3_LOCK_DIR}" 2>/dev/null || true
   fi
 }
 
 acquire_node3_lock() {
-  mkdir -p "${NODE3_LOG_DIR}"
+  mkdir -p "${NODE3_LOG_DIR}" 2>/dev/null || sudo mkdir -p "${NODE3_LOG_DIR}"
+  sudo chown "$(id -u):$(id -g)" "${NODE3_LOG_DIR}" 2>/dev/null || true
 
   if mkdir "${NODE3_LOCK_DIR}" 2>/dev/null; then
     echo "$$" > "${NODE3_LOCK_PID_FILE}"
@@ -57,7 +58,7 @@ acquire_node3_lock() {
   fi
 
   echo "Detected a stale Node 3 lock. Removing it before continuing."
-  rm -rf "${NODE3_LOCK_DIR}"
+  rm -rf "${NODE3_LOCK_DIR}" 2>/dev/null || sudo rm -rf "${NODE3_LOCK_DIR}"
   if mkdir "${NODE3_LOCK_DIR}" 2>/dev/null; then
     echo "$$" > "${NODE3_LOCK_PID_FILE}"
     NODE3_LOCK_OWNED=1
@@ -80,6 +81,11 @@ echo "NODE3_RUN_BATCH_PIPELINE: ${NODE3_RUN_BATCH_PIPELINE}"
 
 cd "${PROJECT_ROOT}"
 
+if [ -x "${PROJECT_ROOT}/scripts/gcp/sync-env-from-gcs.sh" ]; then
+  ENV_FILE="${ENV_FILE}" PROJECT_ROOT="${PROJECT_ROOT}" \
+    bash "${PROJECT_ROOT}/scripts/gcp/sync-env-from-gcs.sh" "${ENV_FILE}" || true
+fi
+
 if [ -f "${ENV_FILE}" ]; then
   set -a
   . "${ENV_FILE}"
@@ -88,6 +94,17 @@ else
   echo "ERROR: ${ENV_FILE} does not exist."
   exit 1
 fi
+
+DEFAULT_RETRAIN_MIN_US_ROWS=0
+if [ "${ENV:-}" = "cloud" ] || [ "${ENV:-}" = "prod" ]; then
+  DEFAULT_RETRAIN_MIN_US_ROWS=3000000
+elif [ -n "${NODE1_INTERNAL_IP:-}" ] && [ "${NODE1_INTERNAL_IP}" != "127.0.0.1" ] && [ "${NODE1_INTERNAL_IP}" != "localhost" ]; then
+  DEFAULT_RETRAIN_MIN_US_ROWS=3000000
+fi
+RETRAIN_MIN_US_ROWS="${RETRAIN_MIN_US_ROWS:-${DEFAULT_RETRAIN_MIN_US_ROWS}}"
+RETRAIN_ALLOW_IF_COUNT_UNAVAILABLE="${RETRAIN_ALLOW_IF_COUNT_UNAVAILABLE:-false}"
+RETRAIN_ROWCOUNT_ENDPOINT="${RETRAIN_ROWCOUNT_ENDPOINT:-http://${NODE1_INTERNAL_IP:-10.128.0.4}:8000/api/v1/pipeline/replay-health}"
+RETRAIN_ROWCOUNT_TABLE="${POSTGRES_US_PREDICTION_TABLE:-${POSTGRES_PREDICTION_TABLE:-traffic_risk_predictions}}"
 
 apt_install_if_missing() {
   if [ "${APT_CACHE_UPDATED}" -eq 0 ]; then
@@ -164,6 +181,62 @@ configure_cloud_sdk_runtime() {
   mkdir -p "${CLOUDSDK_CONFIG}"
   chmod 700 "${CLOUDSDK_CONFIG}"
   echo "Cloud SDK runtime config: ${CLOUDSDK_CONFIG}"
+}
+
+fetch_replay_row_count() {
+  python3 - <<'PY'
+import json
+import os
+import sys
+import urllib.request
+
+endpoint = os.environ.get("RETRAIN_ROWCOUNT_ENDPOINT", "")
+table = os.environ.get("RETRAIN_ROWCOUNT_TABLE", "")
+if not endpoint or not table:
+    sys.exit(0)
+
+try:
+    with urllib.request.urlopen(endpoint, timeout=10) as response:
+        payload = json.load(response)
+    for source in payload.get("sources", []) or []:
+        if str(source.get("table")) == table:
+            count = source.get("row_count")
+            if count is None:
+                break
+            print(int(count))
+            sys.exit(0)
+except Exception:
+    pass
+
+sys.exit(0)
+PY
+}
+
+replay_row_count_below_retrain_gate() {
+  if [ "${RETRAIN_MIN_US_ROWS}" -le 0 ]; then
+    return 1
+  fi
+
+  echo "Checking replay row count before batch/retrain work (min required: ${RETRAIN_MIN_US_ROWS})."
+  local replay_row_count
+  replay_row_count="$(fetch_replay_row_count || true)"
+  replay_row_count="${replay_row_count//$'\r'/}"
+  replay_row_count="${replay_row_count//$'\n'/}"
+  if [ -z "${replay_row_count}" ]; then
+    if [ "${RETRAIN_ALLOW_IF_COUNT_UNAVAILABLE}" = "true" ]; then
+      echo "WARNING: Could not determine replay row count from ${RETRAIN_ROWCOUNT_ENDPOINT}. Continuing batch/retrain work."
+      return 1
+    fi
+    echo "WARNING: Could not determine replay row count from ${RETRAIN_ROWCOUNT_ENDPOINT}. Skipping batch/retrain work."
+    return 0
+  fi
+
+  echo "Replay row count for ${RETRAIN_ROWCOUNT_TABLE}: ${replay_row_count}"
+  if [ "${replay_row_count}" -lt "${RETRAIN_MIN_US_ROWS}" ]; then
+    echo "Replay rows below threshold (${RETRAIN_MIN_US_ROWS}). Skipping batch/retrain work."
+    return 0
+  fi
+  return 1
 }
 
 wait_for_silver_data() {
@@ -251,6 +324,16 @@ if [ "${NODE3_RUN_BATCH_PIPELINE}" != "true" ]; then
   exit 0
 fi
 
+if replay_row_count_below_retrain_gate; then
+  echo "Skipping Silver -> Gold and H2O retraining until enough US replay rows are available."
+  compose_cmd \
+    --project-directory "${NODE3_COMPOSE_DIR}" \
+    --env-file "${ENV_FILE}" \
+    -f "${NODE3_COMPOSE_FILE}" \
+    ps
+  exit 0
+fi
+
 LOCAL_CLOUD_DATA_DIR="${LOCAL_CLOUD_DATA_DIR:-${PROJECT_ROOT}/data/cloud}"
 LOCAL_SILVER_FEATURES_PATH="${LOCAL_SILVER_FEATURES_PATH:-${LOCAL_CLOUD_DATA_DIR}/silver/flink_features}"
 LOCAL_GOLD_RETRAIN_PATH="${LOCAL_GOLD_RETRAIN_PATH:-${LOCAL_CLOUD_DATA_DIR}/gold/features/retrain}"
@@ -320,6 +403,43 @@ gcloud storage rsync -r "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}" "${GOLD_RETRAIN_PAR
 gcloud storage rsync -r "${LOCAL_GOLD_RETRAIN_CSV_PATH}" "${GOLD_RETRAIN_CSV_PATH}"
 
 echo "Running online H2O retraining once from the latest gold data."
+SKIP_H2O_RETRAIN=0
+if ! find "${LOCAL_GOLD_RETRAIN_CSV_PATH}" -type f -name "*.csv" -size +0 -print -quit | grep -q .; then
+  echo "No Gold CSV files found at ${LOCAL_GOLD_RETRAIN_CSV_PATH}. Skipping H2O retraining."
+  SKIP_H2O_RETRAIN=1
+fi
+
+if [ "${SKIP_H2O_RETRAIN}" -eq 0 ] && [ "${RETRAIN_MIN_US_ROWS}" -gt 0 ]; then
+  echo "Checking replay row count before retraining (min required: ${RETRAIN_MIN_US_ROWS})."
+  replay_row_count="$(fetch_replay_row_count || true)"
+  replay_row_count="${replay_row_count//$'\r'/}"
+  replay_row_count="${replay_row_count//$'\n'/}"
+  if [ -z "${replay_row_count}" ]; then
+    if [ "${RETRAIN_ALLOW_IF_COUNT_UNAVAILABLE}" = "true" ]; then
+      echo "WARNING: Could not determine replay row count from ${RETRAIN_ROWCOUNT_ENDPOINT}. Continuing retrain."
+    else
+      echo "WARNING: Could not determine replay row count from ${RETRAIN_ROWCOUNT_ENDPOINT}. Skipping retrain."
+      SKIP_H2O_RETRAIN=1
+    fi
+  else
+    echo "Replay row count for ${RETRAIN_ROWCOUNT_TABLE}: ${replay_row_count}"
+    if [ "${replay_row_count}" -lt "${RETRAIN_MIN_US_ROWS}" ]; then
+      echo "Replay rows below threshold (${RETRAIN_MIN_US_ROWS}). Skipping H2O retraining."
+      SKIP_H2O_RETRAIN=1
+    fi
+  fi
+fi
+
+if [ "${SKIP_H2O_RETRAIN}" -eq 1 ]; then
+  echo "Skipping H2O retraining for this run."
+  compose_cmd \
+    --project-directory "${NODE3_COMPOSE_DIR}" \
+    --env-file "${ENV_FILE}" \
+    -f "${NODE3_COMPOSE_FILE}" \
+    ps
+  exit 0
+fi
+
 RETRAINING_VENV="${PROJECT_ROOT}/.venv-node3"
 RETRAINING_PYTHON="${RETRAINING_VENV}/bin/python"
 if [ ! -x "${RETRAINING_PYTHON}" ]; then
