@@ -98,7 +98,19 @@ export default function PipelinePage() {
     : [];
   const trendSeries = (trendData?.series as AnyRecord[] | undefined) || [];
   const replaySources = (replayData?.sources as AnyRecord[] | undefined) || [];
-  const latestRetrainRun = ((retrainData?.runs as AnyRecord[] | undefined) || [])[0];
+  const retrainRuns = (retrainData?.runs as AnyRecord[] | undefined) || [];
+  const latestRetrainRun = retrainRuns[0];
+  const latestModelRun = retrainRuns.find(
+    (run) => run.status === "FINISHED" && run.metrics && Object.keys(run.metrics).length > 0
+  );
+  const retrainDisplayRun = latestModelRun || latestRetrainRun;
+  const retrainState =
+    latestRetrainRun?.status === "FAILED" && latestModelRun
+      ? String(latestModelRun.status || "unavailable")
+      : String(latestRetrainRun?.status || "unavailable");
+  const retrainDetail = retrainDisplayRun?.start_time
+    ? formatVietnamTimestampLabel("Last run", retrainDisplayRun.start_time)
+    : "No retrain run metadata yet";
 
   const serviceRows = [
     [
@@ -153,10 +165,6 @@ export default function PipelinePage() {
     latencyData?.status === "stale" && latencyData?.window_anchor
       ? formatVietnamTimestampLabel("Latest active window ended", latencyData.window_anchor)
       : `Recent window: ${String(latencyData?.window || "5m")}`;
-  const retrainState = String(latestRetrainRun?.status || "unavailable");
-  const retrainDetail = latestRetrainRun?.start_time
-    ? formatVietnamTimestampLabel("Last run", latestRetrainRun.start_time)
-    : "No retrain run metadata yet";
 
   return (
     <div className="page-stack">
