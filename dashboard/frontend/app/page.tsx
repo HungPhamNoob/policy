@@ -17,7 +17,6 @@ import {
 } from "recharts";
 import { Layers, RefreshCw, Search } from "lucide-react";
 import { api } from "@/lib/api";
-import { fallbackHotspots, fallbackPoints, fallbackSummary } from "@/lib/fallback";
 import { formatVietnamTimestamp } from "@/lib/time";
 import type { Hotspot, MapMode, ModelPerformance, OverviewSummary, PredictionPoint } from "@/lib/types";
 import { FallbackBanner, KpiCard } from "@/components/DataState";
@@ -31,6 +30,16 @@ const DASHBOARD_MAP_POINT_LIMITS: Record<MapMode, number> = {
   replay: 1500,
   live: 1000,
   full: 1500
+};
+const DASHBOARD_LATEST_PREDICTIONS_LIMIT = 30;
+const displayEventId = (eventId: string) => eventId.split("@")[0] || eventId;
+const EMPTY_SUMMARY: OverviewSummary = {
+  total_events: 0,
+  high_risk_events: 0,
+  avg_risk_score: 0,
+  latest_event_time: null,
+  latest_model_version: "latest",
+  mode: "full"
 };
 
 function formatMetricPercent(value: number | null | undefined) {
@@ -64,7 +73,7 @@ export default function DashboardPage() {
   });
   const latestQuery = useQuery({
     queryKey: ["latest", mode],
-    queryFn: () => api.latest(10, mode),
+    queryFn: () => api.latest(DASHBOARD_LATEST_PREDICTIONS_LIMIT, mode),
     refetchInterval: 15_000,
     staleTime: 15_000,
     placeholderData: (previousData) => previousData
@@ -99,23 +108,19 @@ export default function DashboardPage() {
   });
 
   const summary =
-    (summaryQuery.data as OverviewSummary | undefined) || fallbackSummary;
-  const points =
-    ((pointsQuery.data?.points as PredictionPoint[] | undefined) || []).length > 0
-      ? (pointsQuery.data?.points as PredictionPoint[])
-      : fallbackPoints;
+    (summaryQuery.data as OverviewSummary | undefined) || {
+      ...EMPTY_SUMMARY,
+      mode
+    };
+  const points = (pointsQuery.data?.points as PredictionPoint[] | undefined) || [];
   const latest =
-    ((latestQuery.data?.predictions as PredictionPoint[] | undefined) || []).length > 0
-      ? (latestQuery.data?.predictions as PredictionPoint[])
-      : points.slice(0, 8);
-  const hotspots =
-    ((hotspotsQuery.data?.hotspots as Hotspot[] | undefined) || []).length > 0
-      ? (hotspotsQuery.data?.hotspots as Hotspot[])
-      : fallbackHotspots;
+    (latestQuery.data?.predictions as PredictionPoint[] | undefined) || [];
+  const hotspots = (hotspotsQuery.data?.hotspots as Hotspot[] | undefined) || [];
   const fallbackActive =
     summaryQuery.isError ||
     pointsQuery.isError ||
-    (pointsQuery.data?.points as unknown[] | undefined)?.length === 0;
+    latestQuery.isError ||
+    hotspotsQuery.isError;
 
   const highRiskPct = useMemo(() => {
     if (!summary.total_events) return "0%";
@@ -268,41 +273,50 @@ export default function DashboardPage() {
           <section className="card">
             <h2 className="card-title">Active hotspots</h2>
             <div className="side-list">
-              {hotspots.map((hotspot) => (
-                <button
-                  className="row-item"
-                  key={`${hotspot.rank}-${hotspot.center_lat}`}
-                  onClick={() =>
-                    setSelected({
-                      event_id: `hotspot-${hotspot.rank}`,
-                      lat: hotspot.center_lat,
-                      lon: hotspot.center_lon,
-                      risk_score: hotspot.avg_risk_score,
-                      predicted_severity: null,
-                      true_severity: null,
-                      event_time: null,
-                      model_status: "hotspot",
-                      data_source: "us_replay",
-                      marker_shape: "circle",
-                      risk_level:
-                        hotspot.avg_risk_score >= 0.7
-                          ? "high"
-                          : hotspot.avg_risk_score >= 0.4
-                            ? "medium"
-                            : "low"
-                    })
-                  }
-                  type="button"
-                >
+              {hotspots.length > 0 ? (
+                hotspots.map((hotspot) => (
+                  <button
+                    className="row-item"
+                    key={`${hotspot.rank}-${hotspot.center_lat}`}
+                    onClick={() =>
+                      setSelected({
+                        event_id: `hotspot-${hotspot.rank}`,
+                        lat: hotspot.center_lat,
+                        lon: hotspot.center_lon,
+                        risk_score: hotspot.avg_risk_score,
+                        predicted_severity: null,
+                        true_severity: null,
+                        event_time: null,
+                        model_status: "hotspot",
+                        data_source: "us_replay",
+                        marker_shape: "circle",
+                        risk_level:
+                          hotspot.avg_risk_score >= 0.7
+                            ? "high"
+                            : hotspot.avg_risk_score >= 0.4
+                              ? "medium"
+                              : "low"
+                      })
+                    }
+                    type="button"
+                  >
+                    <div className="row-top">
+                      <strong>#{hotspot.rank}</strong>
+                      <span>{Number(hotspot.avg_risk_score).toFixed(3)}</span>
+                    </div>
+                    <span className="muted">
+                      {hotspot.accident_count} events, peak {hotspot.peak_hour ?? "-"}h
+                    </span>
+                  </button>
+                ))
+              ) : (
+                <div className="row-item" aria-live="polite">
                   <div className="row-top">
-                    <strong>#{hotspot.rank}</strong>
-                    <span>{Number(hotspot.avg_risk_score).toFixed(3)}</span>
+                    <strong>No hotspots</strong>
                   </div>
-                  <span className="muted">
-                    {hotspot.accident_count} events, peak {hotspot.peak_hour ?? "-"}h
-                  </span>
-                </button>
-              ))}
+                  <span className="muted">Waiting for replay or live incidents.</span>
+                </div>
+              )}
             </div>
           </section>
         </aside>
@@ -377,15 +391,21 @@ export default function DashboardPage() {
               </tr>
             </thead>
             <tbody>
-              {latest.map((point) => (
+              {latest.length > 0 ? latest.map((point) => (
                 <tr key={point.event_id}>
-                  <td className="mono">{point.event_id}</td>
+                  <td className="mono">{displayEventId(point.event_id)}</td>
                   <td>{Number(point.risk_score).toFixed(4)}</td>
                   <td>{point.predicted_severity ?? point.true_severity ?? "-"}</td>
                   <td>{formatVietnamTimestamp(point.event_time, "-")}</td>
                   <td>{statusText(point)}</td>
                 </tr>
-              ))}
+              )) : (
+                <tr>
+                  <td className="muted" colSpan={5}>
+                    No predictions yet. Waiting for replay or live events.
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>

@@ -100,6 +100,7 @@ export const api = {
     }),
   fullRealtimeResetStatus: () =>
     request("/api/v1/pipeline/full-realtime-reset"),
-  retrainHistory: () => request("/api/v1/model/retrain-history"),
+  retrainHistory: (limit = 30) =>
+    request("/api/v1/model/retrain-history", { params: { limit } }),
   performanceTrend: () => request("/api/v1/model/performance-trend")
 };

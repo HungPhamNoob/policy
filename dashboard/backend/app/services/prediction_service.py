@@ -85,10 +85,11 @@ def _load_overview_source(
     table_name: str,
     table: sql.Identifier,
     risk_score: sql.Composable,
+    prefer_exact_total: bool = False,
 ) -> dict[str, Any]:
     """Return fast source metrics without full-table scans on large replay tables."""
     total_estimate = _table_row_estimate(table_name)
-    if total_estimate <= OVERVIEW_RISK_SAMPLE_LIMIT:
+    if prefer_exact_total or total_estimate <= OVERVIEW_RISK_SAMPLE_LIMIT:
         total_row = fetch_one(
             sql.SQL("SELECT COUNT(*)::BIGINT AS total_events FROM {table}").format(
                 table=table
@@ -218,6 +219,7 @@ def _load_overview_summary(normalized_mode: MapMode) -> dict[str, Any]:
                 table_name=settings.us_prediction_table,
                 table=us_table_identifier(),
                 risk_score=us_risk_score,
+                prefer_exact_total=True,
             )
         )
     if normalized_mode in {"live", "full"} and _table_exists(
@@ -228,6 +230,7 @@ def _load_overview_summary(normalized_mode: MapMode) -> dict[str, Any]:
                 table_name=settings.tomtom_events_table,
                 table=tomtom_table_identifier(),
                 risk_score=tomtom_risk_score,
+                prefer_exact_total=True,
             )
         )
 

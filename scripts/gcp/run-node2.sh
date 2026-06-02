@@ -164,6 +164,9 @@ ensure_us_replay_producers() {
 
   if [ "${NODE2_REFRESH_US_PRODUCERS}" = "true" ]; then
     echo "Refreshing US replay producers because NODE2_REFRESH_US_PRODUCERS=true."
+    export US_REPLAY_START_ROW
+    US_REPLAY_START_ROW="$(compute_us_replay_start_row)"
+    echo "US replay producers will resume from approximate global row ${US_REPLAY_START_ROW}."
     compose_cmd \
       --project-directory "${NODE2_COMPOSE_DIR}" \
       --env-file "${ENV_FILE}" \

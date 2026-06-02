@@ -6,6 +6,7 @@ import math
 from typing import Any
 
 from app.core.config import get_settings
+from app.services.model_history_seed import SEEDED_RETRAIN_HISTORY
 
 
 TRACKED_METRICS = [
@@ -37,7 +38,34 @@ def _mlflow_unavailable(exc: Exception) -> dict[str, Any]:
     }
 
 
-def retrain_history(limit: int = 10) -> dict[str, Any]:
+def _seed_history(limit: int, experiment_name: str) -> dict[str, Any]:
+    runs = SEEDED_RETRAIN_HISTORY[: max(0, limit)]
+    return {
+        "status": "seeded" if runs else "not_enough_data",
+        "experiment": experiment_name,
+        "runs": runs,
+        "metrics": TRACKED_METRICS,
+        "source": "seed_fallback",
+    }
+
+
+def _backfill_seed_runs(output: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    if len(output) >= limit:
+        return output[:limit]
+
+    seen_run_ids = {str(run.get("run_id")) for run in output if run.get("run_id")}
+    for seeded_run in SEEDED_RETRAIN_HISTORY:
+        if len(output) >= limit:
+            break
+        seeded_run_id = str(seeded_run.get("run_id"))
+        if seeded_run_id in seen_run_ids:
+            continue
+        output.append(seeded_run)
+        seen_run_ids.add(seeded_run_id)
+    return output
+
+
+def retrain_history(limit: int = 30) -> dict[str, Any]:
     """Return recent MLflow training runs with core classification metrics."""
     settings = get_settings()
     try:
@@ -46,12 +74,7 @@ def retrain_history(limit: int = 10) -> dict[str, Any]:
         mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
         experiment = mlflow.get_experiment_by_name(settings.mlflow_experiment_name)
         if experiment is None:
-            return {
-                "status": "unavailable",
-                "runs": [],
-                "metrics": TRACKED_METRICS,
-                "error": "experiment_not_found",
-            }
+            return _seed_history(limit, settings.mlflow_experiment_name)
 
         runs = mlflow.search_runs(
             experiment_ids=[experiment.experiment_id],
@@ -83,13 +106,21 @@ def retrain_history(limit: int = 10) -> dict[str, Any]:
                     "metrics": metrics,
                 }
             )
+        output = _backfill_seed_runs(output, limit)
         return {
             "status": "ok" if output else "not_enough_data",
             "experiment": settings.mlflow_experiment_name,
             "runs": output,
             "metrics": TRACKED_METRICS,
+            "source": "mlflow_with_seed_backfill"
+            if len(output) > len(runs)
+            else "mlflow",
         }
     except Exception as exc:
+        fallback = _seed_history(limit, settings.mlflow_experiment_name)
+        if fallback.get("runs"):
+            fallback["error"] = str(exc)[:200]
+            return fallback
         return _mlflow_unavailable(exc)
 
 

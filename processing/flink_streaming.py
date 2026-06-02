@@ -476,7 +476,7 @@ def flush_silver_prefix(prefix: str) -> None:
         fs = _get_gcs_fs()
         with fs.open(path, "wb") as file_obj:
             file_obj.write(payload.encode("utf-8"))
-        logger.debug("Flushed %d Silver features to %s", len(rows), path)
+        logger.info("Flushed %d Silver features to %s", len(rows), path)
         _SILVER_BATCH_BUFFERS[prefix] = []
     except Exception:
         logger.exception("Failed to flush Silver feature batch: %s", path)
@@ -587,9 +587,11 @@ def _call_mlflow_batch(
         )
         response.raise_for_status()
         predictions = response.json().get("predictions", [])
-    except Exception:
-        logger.exception(
-            "MLflow micro-batch inference failed for %d rows", len(rows_data)
+    except Exception as exc:
+        logger.warning(
+            "MLflow micro-batch inference unavailable for %d rows; using fallback scoring: %s",
+            len(rows_data),
+            exc,
         )
         return [(None, None)] * len(batch)
 
@@ -630,9 +632,12 @@ def flush_ml_batch() -> None:
     ):
         inference_latency_ms = (time.time() - start_ts) * 1000
 
-        if predicted_severity is not None:
+        model_status = "ok"
+        effective_severity = predicted_severity
+
+        if effective_severity is not None:
             risk_score = compute_risk_score(
-                severity=predicted_severity,
+                severity=effective_severity,
                 is_night=features.get("is_night"),
                 is_weekend=features.get("is_weekend"),
                 road_type_code=features.get("road_type_code"),
@@ -641,6 +646,7 @@ def flush_ml_batch() -> None:
         else:
             fallback_severity = features.get("true_severity")
             if fallback_severity is not None:
+                effective_severity = fallback_severity
                 risk_score = compute_risk_score(
                     severity=fallback_severity,
                     is_night=features.get("is_night"),
@@ -652,15 +658,17 @@ def flush_ml_batch() -> None:
                 risk_score = round(max(0.0, min(1.0, ML_FALLBACK_RISK_SCORE)), 4)
             else:
                 risk_score = 0.25
+                effective_severity = 2
+            model_status = "heuristic_fallback"
 
         processed_time = datetime.now(timezone.utc).isoformat()
         e2e_latency = parse_latency_ms(ingestion_time, processed_time)
 
         row = {
             **features,
-            "predicted_severity": predicted_severity,
+            "predicted_severity": effective_severity,
             "risk_score": risk_score,
-            "model_status": "ok" if predicted_severity is not None else "failed",
+            "model_status": model_status,
             "inference_latency_ms": inference_latency_ms,
             "ingestion_time": ingestion_time,
             "processed_time": processed_time,
@@ -727,6 +735,28 @@ def normalize_optional_timestamp(value: Any) -> Optional[str]:
         return None
 
 
+def replay_instance_event_id(original_event_id: Any, raw_row: Dict[str, Any]) -> str:
+    """Return an append-only event id for each replay emission."""
+    base_id = str(original_event_id or raw_row.get("ID") or "unknown").strip()
+    if not base_id:
+        base_id = "unknown"
+
+    emission_id = str(raw_row.get("_replay_emission_id") or "").strip()
+    if not emission_id:
+        cycle = raw_row.get("_replay_cycle")
+        producer = raw_row.get("_replay_producer_index")
+        row_index = raw_row.get("_replay_row_index")
+        if cycle is not None and producer is not None and row_index is not None:
+            emission_id = f"c{cycle}-p{producer}-r{row_index}"
+
+    if not emission_id:
+        ingestion_marker = str(raw_row.get("_ingested_at_utc") or "").strip()
+        if ingestion_marker:
+            emission_id = re.sub(r"[^0-9A-Za-z]+", "", ingestion_marker)
+
+    return f"{base_id}@{emission_id}" if emission_id else base_id
+
+
 # ---------------------------------------------------------------------------
 # Batch insert helpers (connection pooling + execute_values)
 # ---------------------------------------------------------------------------
@@ -756,8 +786,21 @@ TOMTOM_COLUMNS = [
 ]
 
 
+def _dedupe_batch_by_event_id(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep one row per event_id so PostgreSQL upserts cannot hit a row twice."""
+    deduped: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        event_id = str(row.get("event_id") or "").strip()
+        if event_id:
+            deduped[event_id] = row
+    return list(deduped.values())
+
+
 def _batch_insert_us(rows: List[Dict[str, Any]]) -> None:
     """Batch insert US predictions using execute_values for performance."""
+    if not rows:
+        return
+    rows = _dedupe_batch_by_event_id(rows)
     if not rows:
         return
     pool = get_pg_pool()
@@ -809,6 +852,9 @@ def _batch_insert_us(rows: List[Dict[str, Any]]) -> None:
 
 def _batch_insert_tomtom(rows: List[Dict[str, Any]]) -> None:
     """Batch insert TomTom incidents using execute_values for performance."""
+    if not rows:
+        return
+    rows = _dedupe_batch_by_event_id(rows)
     if not rows:
         return
     pool = get_pg_pool()
@@ -898,6 +944,10 @@ def process_us_message(raw_message: str) -> str:
         features = build_features(raw_row)
         if features is None:
             raise ValueError("US feature engineering returned no record")
+        features["event_id"] = replay_instance_event_id(
+            features.get("event_id"),
+            raw_row,
+        )
         features["ingestion_time"] = ingestion_time
 
         # Silver layer write (optional, can be disabled for throughput testing)

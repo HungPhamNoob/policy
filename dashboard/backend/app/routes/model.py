@@ -21,7 +21,7 @@ def get_model_info() -> dict:
 
 
 @router.get("/retrain-history")
-def get_retrain_history(limit: int = 10) -> dict:
+def get_retrain_history(limit: int = 30) -> dict:
     """Return recent MLflow retraining runs and core metrics."""
     return retrain_history(limit=limit)
 

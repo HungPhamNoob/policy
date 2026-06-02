@@ -352,7 +352,7 @@ services:
     working_dir: /app
     command: >
       sh -c "
-        npm ci &&
+        if [ ! -d node_modules ]; then npm ci; fi &&
         npm run build &&
         npm run start
       "

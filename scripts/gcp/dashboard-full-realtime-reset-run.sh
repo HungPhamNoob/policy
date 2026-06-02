@@ -53,20 +53,25 @@ sync_runtime_env() {
   if [ ! -f "${ENV_FILE}" ]; then
     return 0
   fi
-  scp -i "${SSH_KEY}" \
+  if ! scp -i "${SSH_KEY}" \
     -o IdentitiesOnly=yes \
     -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null \
     -o ConnectTimeout=20 \
-    "${ENV_FILE}" "${SSH_USER}@${host}:/tmp/.env.cloud.codex-reset"
+    "${ENV_FILE}" "${SSH_USER}@${host}:/tmp/.env.cloud.codex-reset"; then
+    echo "WARNING: Failed to sync runtime env to ${host}. Continuing with the VM's existing ${PROJECT_ROOT}/.env.cloud."
+    return 0
+  fi
 
-  remote_exec "${host}" "
+  if ! remote_exec "${host}" "
     set -euo pipefail
-    mkdir -p '${PROJECT_ROOT}'
-    cp /tmp/.env.cloud.codex-reset '${PROJECT_ROOT}/.env.cloud'
-    cp '${PROJECT_ROOT}/.env.cloud' '${PROJECT_ROOT}/.env'
+    sudo mkdir -p '${PROJECT_ROOT}'
+    sudo cp /tmp/.env.cloud.codex-reset '${PROJECT_ROOT}/.env.cloud'
+    sudo cp '${PROJECT_ROOT}/.env.cloud' '${PROJECT_ROOT}/.env'
     rm -f /tmp/.env.cloud.codex-reset
-  "
+  "; then
+    echo "WARNING: Failed to install synced runtime env on ${host}. Continuing with the VM's existing ${PROJECT_ROOT}/.env.cloud."
+  fi
 }
 
 echo "Syncing runtime environment to the VMs."

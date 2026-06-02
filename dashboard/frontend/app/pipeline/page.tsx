@@ -72,7 +72,7 @@ export default function PipelinePage() {
   });
   const retrain = useQuery({
     queryKey: ["retrain"],
-    queryFn: api.retrainHistory,
+    queryFn: () => api.retrainHistory(30),
     refetchInterval: 60_000
   });
   const trend = useQuery({

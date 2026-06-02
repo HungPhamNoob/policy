@@ -2,23 +2,18 @@
 
 import DeckGL from "@deck.gl/react";
 import { HeatmapLayer } from "@deck.gl/aggregation-layers";
-import { GeoJsonLayer, PolygonLayer, ScatterplotLayer } from "@deck.gl/layers";
+import { PolygonLayer, ScatterplotLayer } from "@deck.gl/layers";
 import type { StyleSpecification } from "maplibre-gl";
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import Map from "react-map-gl/maplibre";
-import { feature } from "topojson-client";
-import countriesTopology from "world-atlas/countries-110m.json";
 import "maplibre-gl/dist/maplibre-gl.css";
 import type { Hotspot, MapMode, PredictionPoint } from "@/lib/types";
 
-const COUNTRY_FEATURES = feature(
-  countriesTopology as any,
-  (countriesTopology as any).objects.countries
-) as any;
+const displayEventId = (eventId: string) => eventId.split("@")[0] || eventId;
 
 const MAP_STYLE: StyleSpecification = {
   version: 8,
-  name: "traffic-risk-local",
+  name: "traffic-risk-dark-raster",
   sources: {
     "carto-dark": {
       type: "raster",
@@ -36,7 +31,7 @@ const MAP_STYLE: StyleSpecification = {
       id: "background",
       type: "background",
       paint: {
-        "background-color": "#081423"
+        "background-color": "#060d17"
       }
     },
     {
@@ -44,9 +39,11 @@ const MAP_STYLE: StyleSpecification = {
       type: "raster",
       source: "carto-dark",
       paint: {
-        "raster-opacity": 0.95,
-        "raster-saturation": -0.35,
-        "raster-contrast": 0.15
+        "raster-opacity": 1,
+        "raster-saturation": -0.1,
+        "raster-contrast": 0.28,
+        "raster-brightness-min": 0.18,
+        "raster-brightness-max": 1
       }
     }
   ]
@@ -142,7 +139,7 @@ function colorForSeverity(point: PredictionPoint): [number, number, number, numb
 }
 
 function triangleForPoint(point: PredictionPoint): [number, number][] {
-  const size = 0.006;
+  const size = 0.003;
   return [
     [point.lon, point.lat + size],
     [point.lon - size * 0.75, point.lat - size],
@@ -195,27 +192,6 @@ const RiskMapInner = memo(function RiskMapInner({
   /* Memoize DeckGL layers so they are only recreated when their data
      or configuration actually changes – not on every parent re-render. */
   const layers = useMemo(() => [
-    new GeoJsonLayer({
-      id: "country-fill",
-      data: COUNTRY_FEATURES,
-      pickable: false,
-      stroked: false,
-      filled: true,
-      opacity: 0.18,
-      getFillColor: [8, 20, 35, 95],
-      getLineColor: [0, 0, 0, 0],
-      lineWidthMinPixels: 0
-    }),
-    new GeoJsonLayer({
-      id: "country-outline",
-      data: COUNTRY_FEATURES,
-      pickable: false,
-      stroked: true,
-      filled: false,
-      opacity: 1,
-      getLineColor: [125, 211, 252, 230],
-      lineWidthMinPixels: 1
-    }),
     showHeatmap &&
       new HeatmapLayer<PredictionPoint>({
         id: "risk-heatmap",
@@ -238,8 +214,8 @@ const RiskMapInner = memo(function RiskMapInner({
       getPosition: (d) => [d.lon, d.lat],
       getRadius: (d) => (d.event_id === selectedId ? 240 : 120),
       getFillColor: (d) => colorForSeverity(d),
-      getLineColor: [255, 255, 255, 210],
-      lineWidthMinPixels: 1,
+      getLineColor: [255, 255, 255, 220],
+      lineWidthMinPixels: 1.2,
       onClick: (info) => {
         if (info.object && onSelect) onSelect(info.object);
       }
@@ -252,8 +228,8 @@ const RiskMapInner = memo(function RiskMapInner({
       filled: true,
       getPolygon: triangleForPoint,
       getFillColor: (d) => colorForSeverity(d),
-      getLineColor: [255, 255, 255, 230],
-      lineWidthMinPixels: 1,
+      getLineColor: [255, 255, 255, 235],
+      lineWidthMinPixels: 1.2,
       onClick: (info) => {
         if (info.object && onSelect) onSelect(info.object);
       }
@@ -269,8 +245,8 @@ const RiskMapInner = memo(function RiskMapInner({
           radiusMaxPixels: 36,
           getPosition: (d) => [d.center_lon, d.center_lat],
           getRadius: (d) => 260 + d.accident_count * 4,
-          getLineColor: [56, 189, 248, 220],
-          lineWidthMinPixels: 2
+          getLineColor: [56, 189, 248, 230],
+          lineWidthMinPixels: 2.4
         })
       : null
   ].filter(Boolean), [points, replayPoints, livePoints, hotspots, selectedId, showHeatmap, onSelect]);
@@ -304,11 +280,11 @@ const RiskMapInner = memo(function RiskMapInner({
         if (point.data_source === "tomtom_live") {
           const severity =
             point.predicted_severity ?? point.true_severity ?? "N/A";
-          return `${point.event_id}\nSeverity ${severity}\nDisplay risk ${riskText}`;
+          return `${displayEventId(point.event_id)}\nSeverity ${severity}\nDisplay risk ${riskText}`;
         }
         const predictedSeverity = point.predicted_severity ?? "N/A";
         const trueSeverity = point.true_severity ?? "N/A";
-        return `${point.event_id}\nPredicted severity ${predictedSeverity}\nTrue severity ${trueSeverity}\nRisk ${riskText}`;
+        return `${displayEventId(point.event_id)}\nPredicted severity ${predictedSeverity}\nTrue severity ${trueSeverity}\nRisk ${riskText}`;
       }}
     >
       <Map reuseMaps mapStyle={MAP_STYLE} attributionControl={false} />

@@ -143,10 +143,25 @@ ensure_prediction_indexes() {
     return 0
   fi
 
+  table_has_column() {
+    local table_name="$1"
+    local column_name="$2"
+    docker exec node1-postgres psql -U "${POSTGRES_USER:-capstone}" -d "${POSTGRES_DB:-capstone_db}" -At \
+      -c "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = '${table_name}' AND column_name = '${column_name}');" 2>/dev/null || true
+  }
+
   ensure_index() {
-    local index_name="$1"
-    local index_expression="$2"
+    local table_name="$1"
+    local index_column="$2"
+    local index_name="$3"
+    local index_expression="$4"
     local is_valid
+
+    if [ "$(table_has_column "${table_name}" "${index_column}")" != "t" ]; then
+      echo "Column ${table_name}.${index_column} does not exist yet; skipping index ${index_name}."
+      return 0
+    fi
+
     is_valid="$(
       docker exec node1-postgres psql -U "${POSTGRES_USER:-capstone}" -d "${POSTGRES_DB:-capstone_db}" -At \
         -c "SELECT COALESCE((SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = '${index_name}'), false);" 2>/dev/null || true
@@ -161,12 +176,12 @@ ensure_prediction_indexes() {
     docker exec node1-postgres psql -U "${POSTGRES_USER:-capstone}" -d "${POSTGRES_DB:-capstone_db}" \
       -c "DROP INDEX CONCURRENTLY IF EXISTS public.${index_name};" >/dev/null
     docker exec node1-postgres psql -U "${POSTGRES_USER:-capstone}" -d "${POSTGRES_DB:-capstone_db}" \
-      -c "CREATE INDEX CONCURRENTLY ${index_name} ON public.traffic_risk_predictions (${index_expression});" >/dev/null
+      -c "CREATE INDEX CONCURRENTLY ${index_name} ON public.${table_name} (${index_expression});" >/dev/null
   }
 
   echo "Ensuring dashboard query indexes exist on traffic_risk_predictions."
-  ensure_index "idx_traffic_risk_predictions_event_time" "event_time DESC NULLS LAST"
-  ensure_index "idx_traffic_risk_predictions_processed_time" "processed_time DESC NULLS LAST"
+  ensure_index "traffic_risk_predictions" "event_time" "idx_traffic_risk_predictions_event_time" "event_time DESC NULLS LAST"
+  ensure_index "traffic_risk_predictions" "processed_time" "idx_traffic_risk_predictions_processed_time" "processed_time DESC NULLS LAST"
 
   # Also ensure indexes on the TomTom incidents table used by live/full mode queries.
   local tomtom_table
@@ -176,8 +191,8 @@ ensure_prediction_indexes() {
   )"
   if [ "${tomtom_table}" = "traffic_tomtom_incidents" ]; then
     echo "Ensuring dashboard query indexes exist on traffic_tomtom_incidents."
-    ensure_index "idx_traffic_tomtom_incidents_event_time" "event_time DESC NULLS LAST"
-    ensure_index "idx_traffic_tomtom_incidents_severity" "severity"
+    ensure_index "traffic_tomtom_incidents" "event_time" "idx_traffic_tomtom_incidents_event_time" "event_time DESC NULLS LAST"
+    ensure_index "traffic_tomtom_incidents" "severity" "idx_traffic_tomtom_incidents_severity" "severity"
   else
     echo "TomTom incidents table does not exist yet; skipping its index guards."
   fi

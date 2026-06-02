@@ -266,6 +266,13 @@ def stream_dataset_once(
 
             key = row.get("ID") or f"row-{row_index}"
             row["_ingested_at_utc"] = datetime.now(timezone.utc).isoformat()
+            row["_replay_cycle"] = cycle_number
+            row["_replay_row_index"] = row_index
+            row["_replay_producer_index"] = PRODUCER_INDEX
+            row["_replay_total_producers"] = TOTAL_PRODUCERS
+            row["_replay_emission_id"] = (
+                f"c{cycle_number}-p{PRODUCER_INDEX}-r{row_index}"
+            )
             value = json.dumps(row, ensure_ascii=False)
 
             produce_with_backpressure(producer, KAFKA_TOPIC, key, value)
