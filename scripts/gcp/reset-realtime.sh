@@ -39,6 +39,9 @@ NODE2_IP="${NODE2_IP:-34.46.107.159}"
 NODE3_IP="${NODE3_IP:-34.63.78.147}"
 SSH_KEY="${SSH_KEY:-~/.ssh/hung_vm_key}"
 SSH_USER="${SSH_USER:-${HUNG_SSH_USER:-$(whoami)}}"
+RESET_LOCAL_COMPOSE="${RESET_LOCAL_COMPOSE:-}"
+RESET_POSTGRES="${RESET_POSTGRES:-}"
+RESET_GCS="${RESET_GCS:-}"
 
 TARGET_NODE="${1:-all}"
 if [[ "${TARGET_NODE}" == --node ]]; then
@@ -76,6 +79,117 @@ SILVER_FEATURES_PATH="${SILVER_FEATURES_PATH:-gs://big-data-group-4-silver/featu
 GOLD_RETRAIN_PATH="${GOLD_RETRAIN_PATH:-gs://big-data-group-4-gold/features/retrain}"
 KAFKA_TOPIC_RAW="${KAFKA_TOPIC_RAW:-traffic.us.raw}"
 KAFKA_TOPIC_TOMTOM="${KAFKA_TOPIC_TOMTOM:-traffic.tomtom.raw}"
+
+bool_enabled() {
+  case "${1:-}" in
+    true|TRUE|1|yes|YES|y|Y) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+compose_down_if_present() {
+  local compose_dir="$1"
+  local compose_file="$2"
+  local compose_project_name="${3:-}"
+  if [ ! -f "${compose_file}" ]; then
+    return 0
+  fi
+  if [ -n "${compose_project_name}" ]; then
+    COMPOSE_PROJECT_NAME="${compose_project_name}" docker compose \
+      --project-directory "${compose_dir}" \
+      --env-file "${ENV_FILE}" \
+      -f "${compose_file}" \
+      down --volumes --remove-orphans 2>/dev/null || true
+    return 0
+  fi
+  docker compose \
+    --project-directory "${compose_dir}" \
+    --env-file "${ENV_FILE}" \
+    -f "${compose_file}" \
+    down --volumes --remove-orphans 2>/dev/null || true
+}
+
+delete_generated_gcs_data() {
+  echo "  Deleting Flink checkpoints: ${FLINK_CHECKPOINT_DIR}"
+  gsutil -m rm -r "${FLINK_CHECKPOINT_DIR%/}/**" 2>/dev/null || echo "    (already empty)"
+
+  echo "  Deleting Spark checkpoints: ${SPARK_CHECKPOINT_DIR}"
+  gsutil -m rm -r "${SPARK_CHECKPOINT_DIR%/}/**" 2>/dev/null || echo "    (already empty)"
+
+  echo "  Deleting Silver features: ${SILVER_FEATURES_PATH}"
+  gsutil -m rm -r "${SILVER_FEATURES_PATH%/}/**" 2>/dev/null || echo "    (already empty)"
+
+  echo "  Deleting Gold retrain data: ${GOLD_RETRAIN_PATH}"
+  gsutil -m rm -r "${GOLD_RETRAIN_PATH%/}/**" 2>/dev/null || echo "    (already empty)"
+}
+
+run_local_reset_if_requested() {
+  if [ -z "${RESET_LOCAL_COMPOSE}${RESET_POSTGRES}${RESET_GCS}" ]; then
+    return 1
+  fi
+
+  echo ""
+  echo "=== Local VM reset mode ==="
+  echo "RESET_LOCAL_COMPOSE=${RESET_LOCAL_COMPOSE:-false}"
+  echo "RESET_POSTGRES=${RESET_POSTGRES:-false}"
+  echo "RESET_GCS=${RESET_GCS:-false}"
+
+  if bool_enabled "${RESET_LOCAL_COMPOSE}"; then
+    echo "  Stopping local Node 2/3 streaming and batch Compose stacks if present..."
+    compose_down_if_present \
+      "${PROJECT_ROOT}/deployment/node2-streaming" \
+      "${PROJECT_ROOT}/deployment/node2-streaming/docker-compose.yaml" \
+      "${NODE2_COMPOSE_PROJECT_NAME:-node2-streaming}"
+    compose_down_if_present \
+      "${PROJECT_ROOT}/deployment/node3-batch" \
+      "${PROJECT_ROOT}/deployment/node3-batch/docker-compose.yaml"
+    docker volume prune -f 2>/dev/null || true
+  fi
+
+  if bool_enabled "${RESET_POSTGRES}"; then
+    if ! docker ps --format '{{.Names}}' | grep -q '^node1-postgres$' && [ -f "${PROJECT_ROOT}/deployment/node1-control/docker-compose.yaml" ]; then
+      echo "  node1-postgres is not running. Starting PostgreSQL only so serving tables can be reset..."
+      docker compose \
+        --project-directory "${PROJECT_ROOT}/deployment/node1-control" \
+        --env-file "${ENV_FILE}" \
+        -f "${PROJECT_ROOT}/deployment/node1-control/docker-compose.yaml" \
+        up -d postgres >/dev/null 2>&1 || true
+      for attempt in $(seq 1 30); do
+        if docker ps --format '{{.Names}}' | grep -q '^node1-postgres$' \
+          && docker exec node1-postgres pg_isready -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null 2>&1; then
+          break
+        fi
+        sleep 2
+      done
+    fi
+
+    if docker ps --format '{{.Names}}' | grep -q '^node1-postgres$'; then
+      echo "  Dropping realtime PostgreSQL serving tables on this VM..."
+      docker exec -i node1-postgres psql -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" <<SQL
+DROP TABLE IF EXISTS ${POSTGRES_PREDICTION_TABLE} CASCADE;
+DROP TABLE IF EXISTS ${POSTGRES_TOMTOM_TABLE} CASCADE;
+SQL
+    else
+      echo "  node1-postgres is not running on this VM. Skipping table reset."
+    fi
+  fi
+
+  if bool_enabled "${RESET_GCS}"; then
+    if command -v gsutil >/dev/null 2>&1; then
+      echo "  Deleting generated GCS checkpoints and Silver/Gold data..."
+      delete_generated_gcs_data
+    else
+      echo "  WARNING: gsutil is unavailable. Skipping GCS cleanup."
+    fi
+  fi
+
+  echo "Local VM reset mode completed at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+  return 0
+}
+
+if run_local_reset_if_requested; then
+  exit 0
+fi
 
 # ===========================================================================
 # Helper: SSH exec on a remote node
@@ -174,7 +288,7 @@ step4_reset_kafka() {
       echo '  Deleting Kafka topics...'
       # Kafka topics are auto-created, but we delete to clear committed offsets
       for topic in ${KAFKA_TOPIC_RAW} ${KAFKA_TOPIC_TOMTOM}; do
-        docker exec node2-kafka kafka-topics.sh --delete --topic \"\${topic}\" \
+        docker exec node2-kafka-1 kafka-topics.sh --delete --topic \"\${topic}\" \
           --bootstrap-server localhost:9092 2>/dev/null || echo \"    (Topic \${topic} may not exist yet)\"
       done
       echo '  Kafka topics reset.'
@@ -191,17 +305,7 @@ step5_reset_gcs() {
   echo ""
   echo "=== Step 5: Deleting GCS checkpoints and generated data ==="
 
-  echo "  Deleting Flink checkpoints: ${FLINK_CHECKPOINT_DIR}"
-  gsutil -m rm -r "${FLINK_CHECKPOINT_DIR%/}/**" 2>/dev/null || echo "    (already empty)"
-
-  echo "  Deleting Spark checkpoints: ${SPARK_CHECKPOINT_DIR}"
-  gsutil -m rm -r "${SPARK_CHECKPOINT_DIR%/}/**" 2>/dev/null || echo "    (already empty)"
-
-  echo "  Deleting Silver features: ${SILVER_FEATURES_PATH}"
-  gsutil -m rm -r "${SILVER_FEATURES_PATH%/}/**" 2>/dev/null || echo "    (already empty)"
-
-  echo "  Deleting Gold retrain data: ${GOLD_RETRAIN_PATH}"
-  gsutil -m rm -r "${GOLD_RETRAIN_PATH%/}/**" 2>/dev/null || echo "    (already empty)"
+  delete_generated_gcs_data
 
   echo "  GCS reset completed."
 }
@@ -298,7 +402,7 @@ echo "==========================================================================
 echo ""
 echo "Next steps:"
 echo "  1. Verify Kafka topics recreated:"
-echo "     ssh ${SSH_USER}@${NODE2_IP} 'docker exec node2-kafka kafka-topics.sh --list --bootstrap-server localhost:9092'"
+echo "     ssh ${SSH_USER}@${NODE2_IP} 'docker exec node2-kafka-1 kafka-topics.sh --list --bootstrap-server localhost:9092'"
 echo ""
 echo "  2. Verify PostgreSQL tables recreated by Flink on first event:"
 echo "     curl -fsS http://${NODE1_IP}:8000/api/v1/overview/summary"

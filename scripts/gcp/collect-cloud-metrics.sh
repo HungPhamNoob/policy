@@ -94,7 +94,7 @@ FROM \$table_name;
   echo
   echo "## Docker Service Status"
   ssh_cmd "${NODE1}" "cd ${PROJECT_ROOT}/deployment/node1-control && docker compose --env-file ${PROJECT_ROOT}/.env.cloud ps"
-  ssh_cmd "${NODE2}" "cd ${PROJECT_ROOT}/deployment/node2-streaming && docker compose --env-file ${PROJECT_ROOT}/.env.cloud ps"
+  ssh_cmd "${NODE2}" "cd ${PROJECT_ROOT}/deployment/node2-streaming && COMPOSE_PROJECT_NAME=node2-streaming docker compose --env-file ${PROJECT_ROOT}/.env.cloud ps"
   ssh_cmd "${NODE3}" "cd ${PROJECT_ROOT}/deployment/node3-batch && docker compose --env-file ${PROJECT_ROOT}/.env.cloud ps"
 } | tee "${OUTPUT_DIR}/cloud-metrics.md"
 

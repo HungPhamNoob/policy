@@ -88,6 +88,8 @@ prepare_runtime_env() {
     printf 'GOLD_RETRAIN_PATH=gs://big-data-group-4-gold/features/retrain/runs/%s\n' "${RUN_ID}"
     printf 'GOLD_RETRAIN_PARQUET_PATH=gs://big-data-group-4-gold/features/retrain/runs/%s/parquet\n' "${RUN_ID}"
     printf 'GOLD_RETRAIN_CSV_PATH=gs://big-data-group-4-gold/features/retrain/runs/%s/csv\n' "${RUN_ID}"
+    printf 'STREAM_MAX_RECORDS=%s\n' "${STREAM_MAX_RECORDS}"
+    printf 'STREAM_THROTTLE_SECONDS=%s\n' "${STREAM_THROTTLE_SECONDS}"
   } >> "${RUNTIME_ENV_FILE}"
 }
 
@@ -107,6 +109,7 @@ prepare_workspace_archive() {
     --exclude="data/cloud" \
     --exclude="ml/mlruns" \
     --exclude=".venv" \
+    --exclude=".venv-*" \
     --exclude=".venv-node1" \
     --exclude=".venv-node3" \
     --exclude="__pycache__" \

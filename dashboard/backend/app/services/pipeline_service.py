@@ -441,6 +441,7 @@ def replay_health() -> dict[str, Any]:
         "total_row_count": total_rows,
         "retrain_min_us_rows": settings.retrain_min_us_rows,
         "retrain_ready": replay_rows >= settings.retrain_min_us_rows,
+        "retrain_policy": "new_silver_data_only",
         "sources": source_health,
     }
 

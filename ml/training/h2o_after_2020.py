@@ -473,11 +473,14 @@ def main():
 
         # ---- Step 8: Evaluate and log top 10 models ----
         top_model_ids = lb_df["model_id"].tolist()
+        if not top_model_ids:
+            raise RuntimeError("H2O AutoML produced no leaderboard models.")
         logger.info(
             "Step 8: Evaluating and logging top %s models...", len(top_model_ids)
         )
 
         best_model = None
+        best_rank = None
         best_macro_f1 = -1.0
         best_logloss = float("inf")
         best_metrics = {}
@@ -500,6 +503,7 @@ def main():
                 best_macro_f1 = current_macro_f1
                 best_logloss = current_logloss
                 best_model = model
+                best_rank = rank
                 best_metrics = sklearn_metrics
 
             logger.info("-" * 60)
@@ -540,6 +544,9 @@ def main():
                 mlflow.h2o.log_model(model, artifact_path=f"retrain_model_rank{rank}")
 
         # ---- Step 9: Register best model ----
+        if best_model is None or not best_metrics:
+            raise RuntimeError("No retrained model passed evaluation.")
+
         logger.info("=" * 60)
         logger.info("Registering the best retrained model...")
         logger.info("Best model ID: %s", best_model.model_id)
@@ -549,6 +556,13 @@ def main():
             "Best model weighted F1: %.6f", best_metrics.get("weighted_f1", 0.0)
         )
         logger.info("Best model logloss: %.6f", best_logloss)
+
+        mlflow.log_param("best_model_rank", best_rank)
+        mlflow.log_param("best_model_id", best_model.model_id)
+        mlflow.log_param("best_model_algo", best_model.algo)
+        mlflow.log_metric("logloss", best_logloss)
+        for metric_name, metric_value in best_metrics.items():
+            mlflow.log_metric(metric_name, metric_value)
 
         mlflow.h2o.log_model(best_model, artifact_path="best_model")
 

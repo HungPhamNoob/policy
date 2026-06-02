@@ -13,15 +13,10 @@ ENV_FILE="${PIPELINE_RUNTIME_ENV_FILE:-/app/.env.cloud}"
 SSH_KEY="${SSH_KEY:-/run/secrets/google_compute_engine}"
 SSH_USER="${SSH_USER:-${HUNG_SSH_USER:-runner}}"
 
-NODE1_HOST="${NODE1_SSH_HOST:-${NODE1_INTERNAL_IP:-10.128.0.4}}"
-NODE2_HOST="${NODE2_SSH_HOST:-${NODE2_INTERNAL_IP:-10.128.0.9}}"
-NODE3_HOST="${NODE3_SSH_HOST:-${NODE3_INTERNAL_IP:-10.128.0.8}}"
-
 echo "============================================================"
 echo "Dashboard-triggered realtime cloud reset started at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "Project root: ${PROJECT_ROOT}"
 echo "Runtime env file: ${ENV_FILE}"
-echo "Targets: node1=${NODE1_HOST}, node2=${NODE2_HOST}, node3=${NODE3_HOST}"
 echo "============================================================"
 
 if [ ! -f "${SSH_KEY}" ]; then
@@ -36,6 +31,12 @@ if [ -f "${ENV_FILE}" ]; then
 else
   echo "WARNING: ${ENV_FILE} is missing. Continuing with runtime environment variables only."
 fi
+
+NODE1_HOST="${NODE1_SSH_HOST:-${NODE1_INTERNAL_IP:-10.128.0.4}}"
+NODE2_HOST="${NODE2_SSH_HOST:-${NODE2_INTERNAL_IP:-10.128.0.9}}"
+NODE3_HOST="${NODE3_SSH_HOST:-${NODE3_INTERNAL_IP:-10.128.0.8}}"
+
+echo "Targets: node1=${NODE1_HOST}, node2=${NODE2_HOST}, node3=${NODE3_HOST}"
 
 remote_exec() {
   local host="$1"

@@ -238,7 +238,7 @@ export default function PipelinePage() {
           detail={
             retrainMinRows > 0
               ? `US replay threshold: ${retrainMinRows.toLocaleString()}`
-              : statusText(replayData)
+              : String(replayData?.retrain_policy || statusText(replayData))
           }
         />
         <KpiCard

@@ -119,7 +119,7 @@ This repository implements the **complete end-to-end data and ML pipeline**:
 │    → Silver JSONL + PostgreSQL traffic_risk_predictions             │
 │    → Spark batch cleaning / dedup / partitioning                   │
 │    → Gold Parquet + CSV                                            │
-│    → H2O AutoML retraining (hourly via Airflow)                    │
+│    → H2O AutoML retraining (15-minute Airflow schedule)            │
 │    → MLflow Model Registry (updated)                               │
 └─────────────────────────────────────────────────────────────────────┘
 
@@ -157,7 +157,7 @@ The pipeline uses a **strict temporal split** to prevent data leakage:
 
 **Design principles:**
 - `before 2020` → Offline model selection and initial training only
-- `from 2020` → Replay simulation, online inference, and hourly retraining inputs
+- `from 2020` → Replay simulation, online inference, and 15-minute retraining inputs
 - No overlap ensures the model never sees future data during training
 
 ---
@@ -185,7 +185,7 @@ Key findings that shaped modeling decisions:
 | **ML Inference** | US events: H2O model served via MLflow; TomTom: rule-based severity from delay/icon signals |
 | **Batch** | Spark validates schema, fills defaults, removes duplicates, writes Gold Parquet/CSV |
 | **Retraining** | H2O AutoML trains/retrains severity models; MLflow logs experiments and tracks model versions |
-| **Orchestration** | Airflow triggers hourly retraining and 2-minute stream health-check DAGs |
+| **Orchestration** | Airflow triggers 15-minute retraining and 2-minute stream health-check DAGs |
 | **Serving** | FastAPI exposes overview, prediction, hotspot, analytics, system, model, and pipeline endpoints |
 | **Dashboard** | Next.js interactive map with 3 modes (Replay ●, Live ▲, Full ●▲), heatmaps, and analytical charts |
 | **Monitoring** | Prometheus + Grafana collect runtime metrics; Blackbox Exporter probes service endpoints |
@@ -460,22 +460,24 @@ Startup logs are written to `/var/log/traffic/node*-bootstrap.log` on each VM.
 
 ### Progressive Retraining Strategy
 
-The system uses a **progressive retraining** approach — models re-train on every Airflow schedule cycle as long as fresh Silver data is detected, not after a fixed row-count threshold:
+The system uses a **progressive retraining** approach: Airflow checks every 15 minutes, but Node 3 only retrains when the Silver feature snapshot has changed. This deliberately removes the old `RETRAIN_MIN_US_ROWS=3,000,000` gate; the correct trigger is **new Silver data**, not a fixed replay row count.
 
-- **Silver freshness gate**: Before each retrain, Node 3 runs `gcloud storage rsync` to pull the latest Silver features from GCS. If new objects exist since the last run, Spark processes them to Gold and H2O AutoML retrains. If no new data arrived, the run exits cleanly (no wasted compute).
+- **Silver freshness gate**: Node 3 builds a deterministic GCS object manifest for `SILVER_FEATURES_PATH`. If it matches the last successful manifest, the run exits cleanly without Spark/H2O work.
+- **Successful watermark**: The Silver manifest is recorded only after Spark writes Gold data and H2O AutoML finishes successfully. A failed retrain does not advance the watermark.
+- **Model metrics contract**: Each retrain logs top model runs plus the registered best model metrics (`accuracy`, `weighted_f1`, `weighted_recall`, `weighted_precision`) to MLflow so the dashboard does not show a finished retrain with missing core metrics.
 - `RETRAIN_MIN_US_ROWS`: **Set to 0 by default** (gate disabled). The row-count threshold proved to be an anti-pattern — during replay, data streams in continuously, so checking for *new* Silver objects is more accurate than checking for a minimum row count. If you want to re-enable, set to a positive integer in `.env.cloud`.
 - `RETRAIN_ALLOW_IF_COUNT_UNAVAILABLE`: set to `true` to continue retrain even if the row-count API is unreachable.
 
 **How it works:**
 1. Node 2 streams US post-2020 data through Kafka → Flink → PostgreSQL `traffic_risk_predictions` + Silver JSONL to GCS
 2. Airflow DAG `model_retrain_hourly` triggers every 15 minutes (`*/15 * * * *`)
-3. Node 3 acquires a mutex lock, then runs `gcloud storage rsync` to pull new Silver files from GCS
+3. Node 3 acquires a mutex lock, then compares the current Silver manifest with the last successful manifest
 4. If new Silver files exist → Spark Silver→Gold → H2O AutoML training → MLflow Model Registry update
 5. If no new Silver files → exits cleanly (no wasted compute)
 6. Flink auto-loads `traffic-risk-model/latest` on each checkpoint cycle
 7. Model quality improves as more post-2020 replay data accumulates
 
-The dashboard pipeline page reports `Retrain loop: Running/Finished/Failed` and shows the last run timestamp. The retrain loop auto-recovers on the next Airflow schedule if any transient failure occurs (network timeout, OOM, lock contention).
+The dashboard pipeline page reports `Retrain loop: Running/Finished/Failed`, source row counts, and the `new_silver_data_only` policy. The retrain loop auto-recovers on the next Airflow schedule if any transient failure occurs (network timeout, OOM, lock contention).
 
 ---
 
@@ -507,7 +509,7 @@ The Next.js dashboard provides three viewing modes:
 |---|---|---|---|
 | **Replay** | ● | US post-2020 accidents | Historical replay data with H2O model inference |
 | **Live** | ▲ | TomTom real-time incidents | Live traffic incidents with rule-based severity |
-| **Full** | ●▲ | Combined | Merged view from both sources |
+| **Full** | ●▲ | Replay + Live | Strict sum of US replay rows and TomTom live incidents |
 
 ### Dashboard Components
 

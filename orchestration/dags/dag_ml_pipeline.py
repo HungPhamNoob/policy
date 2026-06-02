@@ -48,7 +48,7 @@ with DAG(
     dag_id="model_retrain_hourly",
     default_args=default_args,
     description="Periodic H2O AutoML retraining from the latest Flink-generated Silver features",
-    schedule_interval=os.getenv("AIRFLOW_MODEL_RETRAIN_SCHEDULE", "0 * * * *"),
+    schedule_interval=os.getenv("AIRFLOW_MODEL_RETRAIN_SCHEDULE", "*/15 * * * *"),
     start_date=datetime(2026, 5, 1),
     catchup=False,
     max_active_runs=1,

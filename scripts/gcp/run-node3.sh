@@ -19,6 +19,7 @@ NODE3_GCLOUD_STORAGE_TIMEOUT_SECONDS="${NODE3_GCLOUD_STORAGE_TIMEOUT_SECONDS:-60
 NODE3_RESET_LOCAL_SILVER_SNAPSHOT="${NODE3_RESET_LOCAL_SILVER_SNAPSHOT:-false}"
 NODE3_RUN_BATCH_PIPELINE="${NODE3_RUN_BATCH_PIPELINE:-true}"
 NODE3_LOG_DIR="${PROJECT_ROOT}/logs"
+NODE3_STATE_DIR="${NODE3_LOG_DIR}/retrain_state"
 NODE3_LOCK_DIR="${NODE3_LOG_DIR}/.node3-run.lock"
 NODE3_LOCK_PID_FILE="${NODE3_LOCK_DIR}/pid"
 NODE3_LOCK_OWNED=0
@@ -27,6 +28,8 @@ APT_CACHE_UPDATED=0
 NODE3_TEMP_DIR="$(mktemp -d /tmp/node3-run-XXXXXX)"
 NODE3_SILVER_LS_STDOUT="${NODE3_TEMP_DIR}/silver-ls.txt"
 NODE3_SILVER_LS_STDERR="${NODE3_TEMP_DIR}/silver-ls.err"
+NODE3_CURRENT_SILVER_MANIFEST="${NODE3_TEMP_DIR}/silver-manifest.txt"
+NODE3_LAST_SILVER_MANIFEST="${NODE3_STATE_DIR}/last-successful-silver-manifest.txt"
 
 cleanup_node3_temp() {
   rm -rf "${NODE3_TEMP_DIR}" 2>/dev/null || true
@@ -286,6 +289,51 @@ wait_for_silver_data() {
   exit 1
 }
 
+write_silver_manifest() {
+  local silver_prefix="${SILVER_FEATURES_PATH%/}/"
+  mkdir -p "${NODE3_STATE_DIR}"
+  : > "${NODE3_CURRENT_SILVER_MANIFEST}"
+
+  echo "Building Silver object manifest for retrain freshness checks."
+  if ! timeout "${NODE3_GCLOUD_STORAGE_TIMEOUT_SECONDS}" \
+    gcloud storage ls -l -r "${silver_prefix}**" \
+      | awk '/^[[:space:]]*[0-9]+[[:space:]]+/ {print $1 " " $2 " " $3}' \
+      | sort > "${NODE3_CURRENT_SILVER_MANIFEST}"; then
+    echo "ERROR: Could not build Silver object manifest from ${silver_prefix}."
+    exit 1
+  fi
+
+  local object_count
+  object_count="$(wc -l < "${NODE3_CURRENT_SILVER_MANIFEST}" | tr -d ' ')"
+  if [ "${object_count}" -eq 0 ]; then
+    echo "ERROR: Silver manifest is empty even though the prefix was visible."
+    exit 1
+  fi
+  echo "Silver manifest contains ${object_count} objects."
+}
+
+silver_manifest_unchanged_since_last_success() {
+  write_silver_manifest
+  if [ -s "${NODE3_LAST_SILVER_MANIFEST}" ] && cmp -s "${NODE3_CURRENT_SILVER_MANIFEST}" "${NODE3_LAST_SILVER_MANIFEST}"; then
+    echo "No new Silver data since the last successful retrain. Skipping Spark and H2O for this schedule tick."
+    return 0
+  fi
+
+  if [ -s "${NODE3_LAST_SILVER_MANIFEST}" ]; then
+    echo "Silver data changed since the last successful retrain. Continuing with Spark and H2O."
+  else
+    echo "No previous successful Silver manifest exists. Running the first retrain for this replay."
+  fi
+  return 1
+}
+
+mark_silver_manifest_processed() {
+  mkdir -p "${NODE3_STATE_DIR}"
+  cp "${NODE3_CURRENT_SILVER_MANIFEST}" "${NODE3_LAST_SILVER_MANIFEST}"
+  date -u +%Y-%m-%dT%H:%M:%SZ > "${NODE3_STATE_DIR}/last-successful-retrain-at.txt"
+  echo "Recorded Silver manifest for the successful retrain."
+}
+
 configure_cloud_sdk_runtime
 
 echo "Starting Spark services..."
@@ -339,6 +387,15 @@ LOCAL_GOLD_RETRAIN_PARQUET_PATH="${LOCAL_GOLD_RETRAIN_PARQUET_PATH:-${LOCAL_GOLD
 LOCAL_GOLD_RETRAIN_CSV_PATH="${LOCAL_GOLD_RETRAIN_CSV_PATH:-${LOCAL_GOLD_RETRAIN_PATH}/csv}"
 
 wait_for_silver_data
+
+if silver_manifest_unchanged_since_last_success; then
+  compose_cmd \
+    --project-directory "${NODE3_COMPOSE_DIR}" \
+    --env-file "${ENV_FILE}" \
+    -f "${NODE3_COMPOSE_FILE}" \
+    ps
+  exit 0
+fi
 
 echo "Syncing Silver data from GCS to local disk for Spark processing."
 echo "GCS Silver:   ${SILVER_FEATURES_PATH}"
@@ -487,6 +544,8 @@ fi
 H2O_MAX_RUNTIME="${NODE3_H2O_MAX_RUNTIME:-${H2O_MAX_RUNTIME:-600}}" \
   RETRAIN_DATA_PATH="${LOCAL_GOLD_RETRAIN_CSV_PATH}" \
   "${RETRAINING_PYTHON}" ml/training/h2o_after_2020.py
+
+mark_silver_manifest_processed
 
 echo "Node 3 services:"
 compose_cmd \
