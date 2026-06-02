@@ -95,13 +95,11 @@ else
   exit 1
 fi
 
-DEFAULT_RETRAIN_MIN_US_ROWS=0
-if [ "${ENV:-}" = "cloud" ] || [ "${ENV:-}" = "prod" ]; then
-  DEFAULT_RETRAIN_MIN_US_ROWS=3000000
-elif [ -n "${NODE1_INTERNAL_IP:-}" ] && [ "${NODE1_INTERNAL_IP}" != "127.0.0.1" ] && [ "${NODE1_INTERNAL_IP}" != "localhost" ]; then
-  DEFAULT_RETRAIN_MIN_US_ROWS=3000000
-fi
-RETRAIN_MIN_US_ROWS="${RETRAIN_MIN_US_ROWS:-${DEFAULT_RETRAIN_MIN_US_ROWS}}"
+# RETRAIN_MIN_US_ROWS gate is intentionally disabled.
+# The retrain loop now checks for *new* Silver data (timestamp-based rsync diff)
+# instead of a minimum row-count threshold. Set RETRAIN_MIN_US_ROWS=0 in .env.cloud
+# to skip the row-count gate entirely; set it to a positive integer to re-enable.
+RETRAIN_MIN_US_ROWS="${RETRAIN_MIN_US_ROWS:-0}"
 RETRAIN_ALLOW_IF_COUNT_UNAVAILABLE="${RETRAIN_ALLOW_IF_COUNT_UNAVAILABLE:-false}"
 RETRAIN_ROWCOUNT_ENDPOINT="${RETRAIN_ROWCOUNT_ENDPOINT:-http://${NODE1_INTERNAL_IP:-10.128.0.4}:8000/api/v1/pipeline/replay-health}"
 RETRAIN_ROWCOUNT_TABLE="${POSTGRES_US_PREDICTION_TABLE:-${POSTGRES_PREDICTION_TABLE:-traffic_risk_predictions}}"
