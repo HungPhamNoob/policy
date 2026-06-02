@@ -284,19 +284,17 @@ def _fetch_latest_model_metrics() -> dict[str, Any]:
         if not runs:
             return {}
 
-        def weighted_f1_value(run: dict[str, Any]) -> float:
-            metrics = run.get("metrics") or {}
-            value = metrics.get("weighted_f1")
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return -1.0
+        # Find the best model from the most recent successful retrain batch
+        # The best model for each batch is logged with rank=1 (top1)
+        best_run = next((run for run in runs if "top1_" in run.get("run_name", "")), None)
 
-        best_run = max(runs, key=weighted_f1_value)
+        if not best_run:
+            return {}
+
         metrics = dict(best_run.get("metrics") or {})
         metrics["selected_run_id"] = best_run.get("run_id")
         metrics["selected_run_name"] = best_run.get("run_name")
-        metrics["selection_metric"] = "weighted_f1"
+        metrics["selection_metric"] = "latest_top1"
         return metrics
     except Exception:
         return {}
