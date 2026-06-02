@@ -458,17 +458,22 @@ gcloud compute instances add-metadata node3-batch --zone=us-central1-a --project
 
 Startup logs are written to `/var/log/traffic/node*-bootstrap.log` on each VM.
 
-### Retrain Guardrails (avoid early retrain)
+### Progressive Retraining Strategy
 
-Online retraining can be gated until enough replay rows are available:
+The system uses a **progressive retraining** approach — models re-train as soon as enough new data arrives, not after all ~3.8M rows finish replaying:
 
-- `RETRAIN_MIN_US_ROWS`: minimum US replay rows before H2O retraining runs (cloud default: 3,000,000 when `ENV=cloud`)
+- `RETRAIN_MIN_US_ROWS`: minimum US replay rows before H2O retraining runs (cloud default: **100,000** — changed from 3,000,000 to enable continuous retraining while replay is still in progress)
 - `RETRAIN_ALLOW_IF_COUNT_UNAVAILABLE`: set to `false` to skip retrain when row count cannot be read
-- `RETRAIN_ROWCOUNT_ENDPOINT`: API endpoint used to fetch replay row counts
+- `RETRAIN_ROWCOUNT_ENDPOINT`: API endpoint used to fetch replay row counts (default: `http://10.128.0.4:8000/api/v1/pipeline/replay-health`)
 
-The dashboard pipeline page reads the exact replay row count and reports `Waiting for data` until the replay table reaches the configured threshold.
+**How it works:**
+1. Node 2 streams US post-2020 data through Kafka → Flink → PostgreSQL `traffic_risk_predictions`
+2. Airflow DAG `model_retrain_hourly` runs every 15 minutes (`*/15 * * * *`)
+3. Node 3 checks `replay-health` API — if rows ≥ `RETRAIN_MIN_US_ROWS`, Spark processes Silver → Gold, then H2O AutoML retrains
+4. Best model is registered in MLflow Registry → Flink auto-loads `traffic-risk-model/latest`
+5. As more rows accumulate, each subsequent retrain has more data → model improves over time
 
-Set these in `.env.cloud` on Node 3 if you want to override defaults.
+The dashboard pipeline page reports `retrain_ready: true/false` and shows `Retrain loop: Running` when the gate passes. Set `RETRAIN_MIN_US_ROWS` in `.env.cloud` and sync to all nodes + GCS to adjust the threshold.
 
 ---
 
