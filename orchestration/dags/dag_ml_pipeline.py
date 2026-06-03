@@ -4,7 +4,7 @@ orchestration/dags/dag_ml_pipeline.py
 Airflow DAG: model_retrain_hourly
 
 Triggers the US accident severity model retraining pipeline every 20 minutes.
-Uses gcloud compute ssh to start run-node3.sh on node3-batch.
+Uses internal SSH to start run-node3.sh on node3-batch (10.128.0.8).
 """
 
 import os
@@ -25,7 +25,7 @@ default_args = {
 with DAG(
     dag_id="model_retrain_hourly",
     default_args=default_args,
-    description="H2O AutoML retraining every 20 min via gcloud compute ssh",
+    description="H2O AutoML retraining every 20 min via internal SSH",
     schedule_interval=os.getenv("AIRFLOW_MODEL_RETRAIN_SCHEDULE", "*/20 * * * *"),
     start_date=datetime(2026, 5, 1),
     catchup=False,
@@ -38,13 +38,11 @@ with DAG(
         bash_command="""
             set -euo pipefail
             echo "=== [Airflow DAG] Triggering Node3 retrain (Spark + H2O) ==="
-            gcloud compute ssh node3-batch \
-                --project=big-data-group-4 \
-                --zone=us-central1-a \
-                --command="cd /opt/traffic && NODE3_RESET_LOCAL_SILVER_SNAPSHOT=true NODE3_RESET_LOCAL_GOLD_SNAPSHOT=true H2O_MAX_RUNTIME=1200 NODE3_LOCK_BUSY_EXIT_CODE=0 bash scripts/gcp/run-node3.sh" \
-                -- -o StrictHostKeyChecking=no -o ConnectTimeout=30
+            echo "Node3 target: ${NODE3_INTERNAL_IP:-10.128.0.8}"
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 $HUNG_SSH_USER@10.128.0.8 "cd /opt/traffic && RETRAIN_MIN_US_ROWS=0 NODE3_RESET_LOCAL_SILVER_SNAPSHOT=true NODE3_RESET_LOCAL_GOLD_SNAPSHOT=true H2O_MAX_RUNTIME=1200 NODE3_LOCK_BUSY_EXIT_CODE=0 bash scripts/gcp/run-node3.sh"
             echo "=== [Airflow DAG] Retrain completed at $(date -u) ==="
         """,
+        env={"HUNG_SSH_USER": "{{ var.value.get('hung_ssh_user', 'hung') }}"},
         execution_timeout=timedelta(hours=3),
     )
 

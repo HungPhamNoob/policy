@@ -391,61 +391,74 @@ def _compute_retrain_loop_status(
 ) -> dict[str, Any]:
     """Determine retrain loop CONTINUE / FINISHED / FAILED from live conditions.
 
-    CONTINUE = data is actively flowing in OR retrains scheduled by Airflow
-    FINISHED = no new data in 2x schedule window AND >=3 retrain runs completed
-    FAILED = most recent retrain run errored
+    CONTINUE = there is data in the system AND either:
+        - Events are still arriving (within schedule window), OR
+        - TomTom incidents are still streaming, OR
+        - Less than 5 successful retrain batches completed
+    FINISHED = ALL conditions true:
+        1. No new events in 3x schedule window (minimum 60 min idle)
+        2. At least 5 successful retrain batches completed
+        3. TomTom incident stream is also idle for 3x schedule window
+    FAILED = most recent retrain run errored AND no successful runs recently
     """
     global _RETRAIN_LOOP_CACHE, _RETRAIN_LOOP_CACHE_TS
     now_ts = datetime.now(timezone.utc).timestamp()
     if _RETRAIN_LOOP_CACHE and (now_ts - _RETRAIN_LOOP_CACHE_TS) < _RETRAIN_LOOP_CACHE_TTL_S:
         return _RETRAIN_LOOP_CACHE
 
-    # Parse Airflow schedule window
-    schedule_str = os.getenv("AIRFLOW_MODEL_RETRAIN_SCHEDULE", "*/15 * * * *")
-    match = re.fullmatch(r"\*/(\d+)\s+\*\s+\*\s+\*\s+\*", schedule_str)
-    airflow_schedule_minutes = int(match.group(1)) if match else 15
-    data_stale_window_seconds = airflow_schedule_minutes * 120  # 2x schedule
+    MIN_RETRAIN_BATCHES_BEFORE_FINISHED = int(
+        os.getenv("MIN_RETRAIN_BATCHES_BEFORE_FINISHED", "5")
+    )
 
-    # Latest event time across prediction sources
-    latest_event_time: datetime | None = None
+    # Parse Airflow schedule window
+    schedule_str = os.getenv("AIRFLOW_MODEL_RETRAIN_SCHEDULE", "*/20 * * * *")
+    match = re.fullmatch(r"\*/(\d+)\s+\*\s+\*\s+\*\s+\*", schedule_str)
+    airflow_schedule_minutes = int(match.group(1)) if match else 20
+    # Use 3x schedule window as the idle threshold (minimum 60 min for 20-min schedule)
+    data_stale_window_seconds = airflow_schedule_minutes * 180
+
+    # Latest event time across ALL sources (prediction + tomtom)
+    latest_prediction_time: datetime | None = None
+    latest_tomtom_time: datetime | None = None
     for source in source_health:
         et_str = source.get("latest_event_time")
-        if et_str:
-            try:
-                et = datetime.fromisoformat(et_str)
-                if latest_event_time is None or et > latest_event_time:
-                    latest_event_time = et
-            except (ValueError, TypeError):
-                pass
+        if not et_str:
+            continue
+        try:
+            et = datetime.fromisoformat(et_str)
+        except (ValueError, TypeError):
+            continue
+        table = source.get("table", "")
+        if "tomtom" in table.lower():
+            if latest_tomtom_time is None or et > latest_tomtom_time:
+                latest_tomtom_time = et
+        else:
+            if latest_prediction_time is None or et > latest_prediction_time:
+                latest_prediction_time = et
 
     now = datetime.now(timezone.utc)
-    has_data = replay_rows > 0
-    data_is_stale = False
-    if latest_event_time is not None:
-        data_is_stale = (now - latest_event_time).total_seconds() > data_stale_window_seconds
+    has_prediction_data = replay_rows > 0
 
-    # Quick check: if data is clearly flowing, return CONTINUE immediately
-    if has_data and not data_is_stale:
-        result = {
-            "status": "continue",
-            "reason": (
-                f"Data is actively flowing. "
-                f"Latest event: {latest_event_time.isoformat() if latest_event_time else 'N/A'}."
-            ),
-            "latest_event_time": latest_event_time.isoformat() if latest_event_time else None,
-            "schedule_window_minutes": airflow_schedule_minutes * 2,
-            "mlflow_available": True,
-            "has_data": True,
-            "data_is_stale": False,
-            "recent_retrain_runs": -1,
-        }
-        _RETRAIN_LOOP_CACHE = result
-        _RETRAIN_LOOP_CACHE_TS = now_ts
-        return result
+    # Determine staleness for each stream independently
+    prediction_is_stale = False
+    if latest_prediction_time is not None:
+        prediction_is_stale = (now - latest_prediction_time).total_seconds() > data_stale_window_seconds
+    elif has_prediction_data:
+        prediction_is_stale = False  # Has data, just no recent timestamp column
+    else:
+        prediction_is_stale = True  # No data at all
 
-    # Check MLflow retrain runs (cached more aggressively)
+    tomtom_is_stale = False
+    if latest_tomtom_time is not None:
+        tomtom_is_stale = (now - latest_tomtom_time).total_seconds() > data_stale_window_seconds
+
+    # BOTH streams must be stale for the system to be considered idle
+    all_streams_stale = prediction_is_stale and (tomtom_is_stale or latest_tomtom_time is None)
+
+    # Count MLflow retrain runs (cached)
     recent_failed = False
-    recent_runs_count = 0
+    recent_finished_count = 0
+    recent_total_count = 0
     mlflow_available = False
     try:
         import mlflow
@@ -454,53 +467,70 @@ def _compute_retrain_loop_status(
         if experiment is not None:
             runs = mlflow.search_runs(
                 experiment_ids=[experiment.experiment_id],
-                max_results=10,
+                max_results=50,
                 order_by=["start_time DESC"],
             )
-            recent_runs_count = len(runs)
+            recent_total_count = len(runs)
             for _, row in runs.iterrows():
-                if str(row.get("status", "")).upper() == "FAILED":
+                status = str(row.get("status", "")).upper()
+                if status == "FAILED":
                     recent_failed = True
-                    break
+                elif status == "FINISHED" and str(row.get("tags.run_type", "")) == "retrain_online":
+                    recent_finished_count += 1
             mlflow_available = True
     except Exception:
         pass
 
-    # Determine loop status
-    if not has_data:
-        if recent_failed:
-            loop_status = "failed"
-            loop_reason = "No prediction data and most recent retrain run failed."
-        else:
-            loop_status = "continue"
-            loop_reason = "Waiting for initial data replay to begin. Replay events = 0."
-    elif data_is_stale and recent_runs_count >= 3 and not recent_failed:
+    # Build the latest event timestamp for reporting
+    times = []
+    if latest_prediction_time:
+        times.append(latest_prediction_time)
+    if latest_tomtom_time:
+        times.append(latest_tomtom_time)
+    latest_event_time = max(times) if times else None
+
+    # ---- Determine loop status ----
+    if recent_failed and recent_finished_count == 0:
+        loop_status = "failed"
+        loop_reason = "Most recent retrain run FAILED and no successful retrain completed. Airflow will retry on next tick."
+    elif not has_prediction_data and recent_total_count == 0:
+        loop_status = "continue"
+        loop_reason = "Waiting for initial data replay to begin. Replay events = 0."
+    elif all_streams_stale and recent_finished_count >= MIN_RETRAIN_BATCHES_BEFORE_FINISHED:
         loop_status = "finished"
         loop_reason = (
-            f"No new events in {airflow_schedule_minutes * 2} minutes "
-            f"(latest: {latest_event_time.isoformat() if latest_event_time else 'N/A'}). "
-            f"{recent_runs_count} retrain runs completed."
+            f"All data streams are idle for {airflow_schedule_minutes * 3} minutes "
+            f"(prediction idle: {prediction_is_stale}, tomtom idle: {tomtom_is_stale}). "
+            f"{recent_finished_count} retrain batches completed successfully. "
+            f"Latest event: {latest_event_time.isoformat() if latest_event_time else 'N/A'}."
         )
-    elif recent_failed:
-        loop_status = "failed"
-        loop_reason = "Most recent retrain run FAILED. Airflow will retry on next tick."
     else:
         loop_status = "continue"
-        loop_reason = (
-            f"Retrains scheduled every {airflow_schedule_minutes} min. "
-            f"Events: {replay_rows:,}. "
-            f"Latest: {latest_event_time.isoformat() if latest_event_time else 'N/A'}."
-        )
+        parts = []
+        if has_prediction_data and not prediction_is_stale:
+            parts.append(f"Prediction data is actively flowing (latest: {latest_prediction_time.isoformat() if latest_prediction_time else 'N/A'})")
+        if latest_tomtom_time is not None and not tomtom_is_stale:
+            parts.append(f"TomTom incidents are streaming (latest: {latest_tomtom_time.isoformat()})")
+        if recent_finished_count < MIN_RETRAIN_BATCHES_BEFORE_FINISHED:
+            parts.append(f"Retrain batches completed: {recent_finished_count}/{MIN_RETRAIN_BATCHES_BEFORE_FINISHED} (minimum required before FINISHED)")
+        if not parts:
+            parts.append(f"Retrains scheduled every {airflow_schedule_minutes} min. Events: {replay_rows:,}")
+        loop_reason = ". ".join(parts) + "."
 
     result = {
         "status": loop_status,
         "reason": loop_reason,
         "latest_event_time": latest_event_time.isoformat() if latest_event_time else None,
-        "schedule_window_minutes": airflow_schedule_minutes * 2,
+        "latest_prediction_time": latest_prediction_time.isoformat() if latest_prediction_time else None,
+        "latest_tomtom_time": latest_tomtom_time.isoformat() if latest_tomtom_time else None,
+        "schedule_window_minutes": airflow_schedule_minutes * 3,
         "mlflow_available": mlflow_available,
-        "has_data": has_data,
-        "data_is_stale": data_is_stale,
-        "recent_retrain_runs": recent_runs_count,
+        "has_data": has_prediction_data,
+        "prediction_is_stale": prediction_is_stale,
+        "tomtom_is_stale": tomtom_is_stale,
+        "recent_retrain_runs": recent_total_count,
+        "recent_retrain_finished": recent_finished_count,
+        "min_retrain_batches_required": MIN_RETRAIN_BATCHES_BEFORE_FINISHED,
     }
     _RETRAIN_LOOP_CACHE = result
     _RETRAIN_LOOP_CACHE_TS = now_ts

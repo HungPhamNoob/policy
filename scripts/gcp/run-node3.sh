@@ -519,31 +519,41 @@ wait_for_silver_data
 
 mkdir -p "${LOCAL_SILVER_FEATURES_PATH}" "${LOCAL_GOLD_RETRAIN_PATH}"
 
-if silver_snapshot_unchanged_since_last_success; then
-  echo "No unretrained local backlog was found before sync."
-fi
-
 echo "Syncing Silver data from GCS to local disk for Spark processing."
 echo "GCS Silver:   ${SILVER_FEATURES_PATH}"
 echo "Local Silver: ${LOCAL_SILVER_FEATURES_PATH}"
 
-# Silver replay data is append-only in production. Keeping the previous local
-# snapshot lets Node 3 continue from where the last sync stopped instead of
-# re-downloading the entire history on every retrain run.
+# IMPORTANT: Reset the local Silver snapshot FIRST, before computing the delta
+# manifest. Otherwise the manifest is calculated from files that are about to be
+# deleted, causing Spark to run on an empty local directory.
 if [ "${NODE3_RESET_LOCAL_SILVER_SNAPSHOT}" = "true" ]; then
   echo "Resetting the local Silver snapshot before sync because NODE3_RESET_LOCAL_SILVER_SNAPSHOT=true."
   sudo rm -rf "${LOCAL_SILVER_FEATURES_PATH}"
+  mkdir -p "${LOCAL_SILVER_FEATURES_PATH}"
+  # When resetting, we MUST re-sync from GCS to have data for Spark
+  echo "Full re-sync from GCS after local reset..."
+  gcloud storage rsync -r "${SILVER_FEATURES_PATH}" "${LOCAL_SILVER_FEATURES_PATH}" || {
+    echo "WARNING: Full Silver rsync after reset reported errors. Continuing with what was downloaded."
+  }
+  # Clear the last successful watermark so ALL data gets processed
+  rm -f "${NODE3_LAST_SUCCESSFUL_SILVER_WATERMARK_FILE}"
+  echo "Cleared last-successful watermark to ensure full dataset retraining."
 else
   echo "Preserving the existing local Silver snapshot so rsync can continue incrementally."
+  # Only run incremental delta check when NOT resetting
+  if silver_snapshot_unchanged_since_last_success; then
+    echo "No unretrained local backlog was found before sync."
+  fi
+  if [ "${NODE3_LOCAL_PENDING_DELTA_COUNT}" -gt 0 ]; then
+    echo "Skipping the remote Silver rsync for this tick because a large unretrained local backlog already exists."
+    echo "The next scheduled retrain will pull additional remote Silver files after this backlog is consumed."
+  else
+    sync_silver_snapshot
+  fi
 fi
 
-if [ "${NODE3_LOCAL_PENDING_DELTA_COUNT}" -gt 0 ]; then
-  echo "Skipping the remote Silver rsync for this tick because a large unretrained local backlog already exists."
-  echo "The next scheduled retrain will pull additional remote Silver files after this backlog is consumed."
-else
-  sync_silver_snapshot
-  build_local_silver_delta_manifest
-fi
+# Always rebuild the delta manifest after syncing (or after reset+full sync)
+build_local_silver_delta_manifest
 
 if [ "${NODE3_LOCAL_PENDING_DELTA_COUNT}" -eq 0 ]; then
   echo "No new Silver data since the last successful retrain. Skipping Spark and H2O for this schedule tick."
