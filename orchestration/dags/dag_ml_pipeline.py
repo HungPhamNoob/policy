@@ -38,32 +38,32 @@ with DAG(
         bash_command="""
             set -euo pipefail
             echo "=== [Airflow DAG] Triggering Node3 retrain (Spark + H2O) ==="
-            SSH_KEY_PATH="$${SSH_KEY:-/run/secrets/google_compute_engine}"
-            SSH_USER="$${HUNG_SSH_USER:-runner}"
-            NODE3_IP="$${NODE3_INTERNAL_IP:-10.128.0.8}"
-            echo "Node3 target: $${SSH_USER}@$${NODE3_IP}"
-            echo "SSH key path: $${SSH_KEY_PATH}"
+            SSH_KEY_PATH="${SSH_KEY:-/run/secrets/google_compute_engine}"
+            SSH_USER="${HUNG_SSH_USER:-runner}"
+            NODE3_IP="${NODE3_INTERNAL_IP:-10.128.0.8}"
+            echo "Node3 target: ${SSH_USER}@${NODE3_IP}"
+            echo "SSH key path: ${SSH_KEY_PATH}"
 
-            if [ ! -f "$${SSH_KEY_PATH}" ]; then
-                echo "ERROR: SSH key not found at $${SSH_KEY_PATH}. Cannot trigger retrain."
+            if [ ! -f "${SSH_KEY_PATH}" ]; then
+                echo "ERROR: SSH key not found at ${SSH_KEY_PATH}. Cannot trigger retrain."
                 exit 1
             fi
 
-            echo "Using SSH key: $${SSH_KEY_PATH}"
-            ssh -i "$${SSH_KEY_PATH}" \
+            echo "Using SSH key: ${SSH_KEY_PATH}"
+            ssh -i "${SSH_KEY_PATH}" \
                 -o StrictHostKeyChecking=no \
                 -o ConnectTimeout=60 \
-                "$${SSH_USER}@$${NODE3_IP}" \
+                "${SSH_USER}@${NODE3_IP}" \
                 "cd /opt/traffic && RETRAIN_MIN_US_ROWS=0 NODE3_RESET_LOCAL_SILVER_SNAPSHOT=true NODE3_RESET_LOCAL_GOLD_SNAPSHOT=true H2O_MAX_RUNTIME=3600 NODE3_LOCK_BUSY_EXIT_CODE=0 bash scripts/gcp/run-node3.sh"
 
             echo "=== [Airflow DAG] Retrain completed at $(date -u) ==="
         """,
         env={
-            "HUNG_SSH_USER": "{{ var.value.get('hung_ssh_user', 'runner') }}",
-            "SSH_KEY": "{{ var.value.get('ssh_key', '/run/secrets/google_compute_engine') }}",
-            "NODE3_INTERNAL_IP": "{{ var.value.get('node3_internal_ip', '10.128.0.8') }}",
+            "HUNG_SSH_USER": "runner",
+            "SSH_KEY": "/run/secrets/google_compute_engine",
+            "NODE3_INTERNAL_IP": "10.128.0.8",
         },
-        execution_timeout=timedelta(hours=3),
+        execution_timeout=timedelta(hours=4),
     )
 
     notify = BashOperator(

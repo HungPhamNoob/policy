@@ -90,9 +90,19 @@ echo "Node 3 execution lock acquired by PID $$."
 echo "NODE3_RUN_BATCH_PIPELINE: ${NODE3_RUN_BATCH_PIPELINE}"
 
 cd "${PROJECT_ROOT}"
+
+if [ ! -f "${ENV_FILE}" ]; then
   echo "ERROR: ${ENV_FILE} does not exist."
   exit 1
 fi
+
+# Export only valid KEY=VALUE lines from .env.cloud (avoids source errors)
+while IFS= read -r line; do
+    case "${line}" in
+        ''|\#*) continue ;;
+        *=*) export "${line}" ;;
+    esac
+done < "${ENV_FILE}"
 
 # RETRAIN_MIN_US_ROWS gate is intentionally disabled.
 # The retrain loop now checks for *new* Silver data (timestamp-based rsync diff)
