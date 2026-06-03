@@ -90,17 +90,6 @@ echo "Node 3 execution lock acquired by PID $$."
 echo "NODE3_RUN_BATCH_PIPELINE: ${NODE3_RUN_BATCH_PIPELINE}"
 
 cd "${PROJECT_ROOT}"
-
-if [ -x "${PROJECT_ROOT}/scripts/gcp/sync-env-from-gcs.sh" ]; then
-  ENV_FILE="${ENV_FILE}" PROJECT_ROOT="${PROJECT_ROOT}" \
-    bash "${PROJECT_ROOT}/scripts/gcp/sync-env-from-gcs.sh" "${ENV_FILE}" || true
-fi
-
-if [ -f "${ENV_FILE}" ]; then
-  set -a
-  . "${ENV_FILE}"
-  set +a
-else
   echo "ERROR: ${ENV_FILE} does not exist."
   exit 1
 fi
