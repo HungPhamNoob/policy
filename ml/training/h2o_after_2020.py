@@ -23,10 +23,12 @@ Differences from h2o_before_2020.py:
     - Uses the same H2O AutoML + MLflow logging logic.
 """
 
-import os
 import logging
+import os
 import tempfile
+import time
 from pathlib import Path
+
 import h2o
 from h2o.automl import H2OAutoML
 import mlflow
@@ -72,6 +74,8 @@ MAX_RUNTIME_SECS = int(
 )  # Shorter for hourly retrain
 H2O_MAX_MEM = os.getenv("H2O_MAX_MEM", "2G")
 H2O_NTHREADS = int(os.getenv("H2O_NTHREADS", "2"))
+H2O_IP = os.getenv("H2O_IP", "127.0.0.1")
+H2O_PORT = int(os.getenv("H2O_PORT", "54321"))
 USE_CLASS_SAMPLING_FACTORS = (
     os.getenv("H2O_USE_CLASS_SAMPLING_FACTORS", "true").lower() == "true"
 )
@@ -134,6 +138,33 @@ def log_metric_if_exists(perf, metric_name, mlflow_name=None, log_prefix="  "):
 
     logger.info("%s%s:                   N/A", log_prefix, metric_name.capitalize())
     return False
+
+
+def shutdown_existing_local_h2o():
+    """Stop a stale local H2O cluster so each retrain starts from a clean JVM."""
+    cluster_url = f"http://{H2O_IP}:{H2O_PORT}"
+    logger.info("Checking for an existing local H2O cluster at %s...", cluster_url)
+
+    try:
+        h2o.connect(url=cluster_url, verbose=False)
+    except Exception:
+        logger.info("No existing local H2O cluster detected.")
+        return
+
+    try:
+        logger.warning(
+            "Found an existing local H2O cluster at %s. Shutting it down before retraining.",
+            cluster_url,
+        )
+        h2o.cluster().shutdown(prompt=False)
+        time.sleep(5)
+    except Exception as exc:
+        logger.warning("Could not cleanly shut down the existing H2O cluster: %s", exc)
+    finally:
+        try:
+            h2o.connection().close()
+        except Exception:
+            pass
 
 
 def evaluate_classifier_with_sklearn(
@@ -375,7 +406,10 @@ def main():
 
     # ---- Step 1: Initialize H2O cluster ----
     logger.info("Step 1: Initializing H2O cluster...")
+    shutdown_existing_local_h2o()
     h2o.init(
+        ip=H2O_IP,
+        port=H2O_PORT,
         max_mem_size=H2O_MAX_MEM,
         nthreads=H2O_NTHREADS,
     )

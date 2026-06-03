@@ -136,6 +136,42 @@ sync_runtime_env_to_gcs() {
   gcloud storage cp "${ENV_FILE}" "${gcs_env_path}" >/dev/null
 }
 
+ensure_ssh_key_mount_source() {
+  local configured_path="${FASTAPI_SSH_KEY_PATH:-}"
+  local resolved_path=""
+  local candidate_paths=()
+  local target_user="${HUNG_SSH_USER:-$(whoami)}"
+
+  if [ -n "${configured_path}" ]; then
+    candidate_paths+=("${configured_path}")
+  fi
+  candidate_paths+=("${HOME}/.ssh/google_compute_engine")
+  candidate_paths+=("/home/${target_user}/.ssh/google_compute_engine")
+
+  local candidate_path
+  for candidate_path in "${candidate_paths[@]}"; do
+    if [ -n "${candidate_path}" ] && [ -f "${candidate_path}" ]; then
+      resolved_path="${candidate_path}"
+      break
+    fi
+  done
+
+  if [ -z "${resolved_path}" ]; then
+    echo "WARNING: Could not find an inter-node SSH key for Airflow/FastAPI mounts."
+    return 0
+  fi
+
+  if [ -n "${configured_path}" ] && [ "${configured_path}" != "${resolved_path}" ]; then
+    echo "Linking ${configured_path} -> ${resolved_path} for container SSH access."
+    mkdir -p "$(dirname "${configured_path}")"
+    ln -sfn "${resolved_path}" "${configured_path}"
+    resolved_path="${configured_path}"
+  fi
+
+  export FASTAPI_SSH_KEY_PATH="${resolved_path}"
+  echo "Using inter-node SSH key mount source: ${FASTAPI_SSH_KEY_PATH}"
+}
+
 ensure_inter_node_ssh_access() {
   local key_path="${FASTAPI_SSH_KEY_PATH:-}"
   local target_user="${HUNG_SSH_USER:-runner}"
@@ -329,6 +365,7 @@ fi
 
 echo "Starting Node 1 Docker services from the current workspace snapshot..."
 prepare_runtime_directories
+ensure_ssh_key_mount_source
 sync_runtime_env_to_gcs
 ensure_inter_node_ssh_access
 

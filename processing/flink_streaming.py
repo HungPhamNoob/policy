@@ -103,6 +103,7 @@ MLFLOW_SERVING_ENDPOINT = os.getenv(
 ML_TIMEOUT_SECONDS = float(os.getenv("ML_TIMEOUT_SECONDS", "5"))
 ML_FALLBACK_RISK_SCORE = float(os.getenv("ML_FALLBACK_RISK_SCORE", "-1"))
 ML_BATCH_SIZE = int(os.getenv("ML_BATCH_SIZE", "100"))
+ML_MAX_BUFFER_AGE_MS = int(os.getenv("ML_MAX_BUFFER_AGE_MS", "750"))
 
 SILVER_FEATURES_PATH = os.getenv(
     "SILVER_FEATURES_PATH",
@@ -116,6 +117,7 @@ SILVER_WRITE_ENABLED = os.getenv("SILVER_WRITE_ENABLED", "true").lower() in {
 SILVER_FLUSH_EVERY_N = int(
     os.getenv("SILVER_FLUSH_EVERY_N", os.getenv("SILVER_BATCH_SIZE", "100"))
 )
+SILVER_MAX_BUFFER_AGE_MS = int(os.getenv("SILVER_MAX_BUFFER_AGE_MS", "1500"))
 
 PG_HOST = os.getenv("POSTGRES_HOST", "10.128.0.4")
 PG_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
@@ -125,6 +127,7 @@ PG_PASSWORD = os.getenv("POSTGRES_PASSWORD", "123")
 PG_POOL_MIN = int(os.getenv("PG_POOL_MIN_CONN", "1"))
 PG_POOL_MAX = int(os.getenv("PG_POOL_MAX_CONN", "4"))
 PG_BATCH_SIZE = int(os.getenv("PG_BATCH_SIZE", "200"))
+PG_MAX_BUFFER_AGE_MS = int(os.getenv("PG_MAX_BUFFER_AGE_MS", "750"))
 PG_US_TABLE = os.getenv(
     "POSTGRES_US_PREDICTION_TABLE",
     os.getenv("POSTGRES_PREDICTION_TABLE", "traffic_risk_predictions"),
@@ -165,9 +168,12 @@ PG_POOL: Optional[SimpleConnectionPool] = None
 US_BATCH_BUFFER: List[Dict[str, Any]] = []
 TOMTOM_BATCH_BUFFER: List[Dict[str, Any]] = []
 _SCHEMA_INITIALIZED = False
+US_BATCH_BUFFER_STARTED_AT: Optional[float] = None
+TOMTOM_BATCH_BUFFER_STARTED_AT: Optional[float] = None
 
 # Micro-batch MLflow inference buffer
 _ML_INFERENCE_BUFFER: List[Tuple[Dict[str, Any], str, float]] = []
+_ML_INFERENCE_BUFFER_STARTED_AT: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +445,14 @@ def initialize_schemas() -> None:
 
 _GCS_FS = None
 _SILVER_BATCH_BUFFERS: Dict[str, List[Dict[str, Any]]] = {}
+_SILVER_BATCH_STARTED_AT: Dict[str, float] = {}
+
+
+def _buffer_age_ms(started_at: Optional[float]) -> float:
+    """Return the current age for a buffer based on monotonic time."""
+    if started_at is None:
+        return 0.0
+    return (time.monotonic() - started_at) * 1000.0
 
 
 def _get_gcs_fs():
@@ -478,6 +492,7 @@ def flush_silver_prefix(prefix: str) -> None:
             file_obj.write(payload.encode("utf-8"))
         logger.info("Flushed %d Silver features to %s", len(rows), path)
         _SILVER_BATCH_BUFFERS[prefix] = []
+        _SILVER_BATCH_STARTED_AT.pop(prefix, None)
     except Exception:
         logger.exception("Failed to flush Silver feature batch: %s", path)
 
@@ -495,8 +510,13 @@ def write_to_gcs_silver(features: Dict[str, Any]) -> None:
 
     prefix = _silver_prefix(features)
     buffer = _SILVER_BATCH_BUFFERS.setdefault(prefix, [])
+    if prefix not in _SILVER_BATCH_STARTED_AT:
+        _SILVER_BATCH_STARTED_AT[prefix] = time.monotonic()
     buffer.append(features)
-    if len(buffer) >= SILVER_FLUSH_EVERY_N:
+    if (
+        len(buffer) >= SILVER_FLUSH_EVERY_N
+        or _buffer_age_ms(_SILVER_BATCH_STARTED_AT.get(prefix)) >= SILVER_MAX_BUFFER_AGE_MS
+    ):
         flush_silver_prefix(prefix)
 
 
@@ -606,12 +626,13 @@ def _call_mlflow_batch(
 
 def flush_ml_batch() -> None:
     """Flush the buffered MLflow inference micro-batch."""
-    global _ML_INFERENCE_BUFFER
+    global _ML_INFERENCE_BUFFER, _ML_INFERENCE_BUFFER_STARTED_AT
     if not _ML_INFERENCE_BUFFER:
         return
 
     batch = _ML_INFERENCE_BUFFER
     _ML_INFERENCE_BUFFER = []
+    _ML_INFERENCE_BUFFER_STARTED_AT = None
 
     batch_start = time.time()
     predictions = _call_mlflow_batch(batch)
@@ -690,9 +711,15 @@ def call_mlflow_model(
         features.get("ingestion_time", features.get("_ingested_at_utc"))
     )
 
+    global _ML_INFERENCE_BUFFER_STARTED_AT
+    if _ML_INFERENCE_BUFFER_STARTED_AT is None:
+        _ML_INFERENCE_BUFFER_STARTED_AT = time.monotonic()
     _ML_INFERENCE_BUFFER.append((features, ingestion_time, start))
 
-    if len(_ML_INFERENCE_BUFFER) >= ML_BATCH_SIZE:
+    if (
+        len(_ML_INFERENCE_BUFFER) >= ML_BATCH_SIZE
+        or _buffer_age_ms(_ML_INFERENCE_BUFFER_STARTED_AT) >= ML_MAX_BUFFER_AGE_MS
+    ):
         flush_ml_batch()
 
     # Return a placeholder — actual values are filled by flush_ml_batch
@@ -898,32 +925,59 @@ def _batch_insert_tomtom(rows: List[Dict[str, Any]]) -> None:
 
 def flush_us_batch() -> None:
     """Flush the US batch buffer to PostgreSQL."""
-    global US_BATCH_BUFFER
+    global US_BATCH_BUFFER, US_BATCH_BUFFER_STARTED_AT
     if US_BATCH_BUFFER:
         _batch_insert_us(US_BATCH_BUFFER)
         US_BATCH_BUFFER = []
+        US_BATCH_BUFFER_STARTED_AT = None
 
 
 def flush_tomtom_batch() -> None:
     """Flush the TomTom batch buffer to PostgreSQL."""
-    global TOMTOM_BATCH_BUFFER
+    global TOMTOM_BATCH_BUFFER, TOMTOM_BATCH_BUFFER_STARTED_AT
     if TOMTOM_BATCH_BUFFER:
         _batch_insert_tomtom(TOMTOM_BATCH_BUFFER)
         TOMTOM_BATCH_BUFFER = []
+        TOMTOM_BATCH_BUFFER_STARTED_AT = None
 
 
 def buffer_us_row(row: Dict[str, Any]) -> None:
     """Add a US prediction row to the batch buffer; flush when full."""
+    global US_BATCH_BUFFER_STARTED_AT
+    if US_BATCH_BUFFER_STARTED_AT is None:
+        US_BATCH_BUFFER_STARTED_AT = time.monotonic()
     US_BATCH_BUFFER.append(row)
-    if len(US_BATCH_BUFFER) >= PG_BATCH_SIZE:
+    if (
+        len(US_BATCH_BUFFER) >= PG_BATCH_SIZE
+        or _buffer_age_ms(US_BATCH_BUFFER_STARTED_AT) >= PG_MAX_BUFFER_AGE_MS
+    ):
         flush_us_batch()
 
 
 def buffer_tomtom_row(row: Dict[str, Any]) -> None:
     """Add a TomTom incident row to the batch buffer; flush when full."""
+    global TOMTOM_BATCH_BUFFER_STARTED_AT
+    if TOMTOM_BATCH_BUFFER_STARTED_AT is None:
+        TOMTOM_BATCH_BUFFER_STARTED_AT = time.monotonic()
     TOMTOM_BATCH_BUFFER.append(row)
-    if len(TOMTOM_BATCH_BUFFER) >= PG_BATCH_SIZE:
+    if (
+        len(TOMTOM_BATCH_BUFFER) >= PG_BATCH_SIZE
+        or _buffer_age_ms(TOMTOM_BATCH_BUFFER_STARTED_AT) >= PG_MAX_BUFFER_AGE_MS
+    ):
         flush_tomtom_batch()
+
+
+def flush_stale_buffers_if_needed() -> None:
+    """Bound end-to-end latency by flushing aged buffers even when they are not full."""
+    if _ML_INFERENCE_BUFFER and _buffer_age_ms(_ML_INFERENCE_BUFFER_STARTED_AT) >= ML_MAX_BUFFER_AGE_MS:
+        flush_ml_batch()
+    if US_BATCH_BUFFER and _buffer_age_ms(US_BATCH_BUFFER_STARTED_AT) >= PG_MAX_BUFFER_AGE_MS:
+        flush_us_batch()
+    if TOMTOM_BATCH_BUFFER and _buffer_age_ms(TOMTOM_BATCH_BUFFER_STARTED_AT) >= PG_MAX_BUFFER_AGE_MS:
+        flush_tomtom_batch()
+    for prefix in list(_SILVER_BATCH_STARTED_AT):
+        if _buffer_age_ms(_SILVER_BATCH_STARTED_AT.get(prefix)) >= SILVER_MAX_BUFFER_AGE_MS:
+            flush_silver_prefix(prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -939,6 +993,7 @@ def process_us_message(raw_message: str) -> str:
            -> unified risk score -> batch PostgreSQL insert.
     """
     try:
+        flush_stale_buffers_if_needed()
         raw_row = json.loads(raw_message)
         ingestion_time = normalize_optional_timestamp(raw_row.get("_ingested_at_utc"))
         features = build_features(raw_row)
@@ -972,6 +1027,7 @@ def process_tomtom_message(raw_message: str) -> str:
     No MLflow inference is used for TomTom events.
     """
     try:
+        flush_stale_buffers_if_needed()
         raw_row = json.loads(raw_message)
         ingestion_time = normalize_optional_timestamp(
             raw_row.get("_ingested_at_utc") or raw_row.get("ingestion_time")
@@ -1074,6 +1130,12 @@ def main() -> None:
         "Silver write: enabled=%s batch_size=%d",
         SILVER_WRITE_ENABLED,
         SILVER_FLUSH_EVERY_N,
+    )
+    logger.info(
+        "Buffer age limits: ml=%dms pg=%dms silver=%dms",
+        ML_MAX_BUFFER_AGE_MS,
+        PG_MAX_BUFFER_AGE_MS,
+        SILVER_MAX_BUFFER_AGE_MS,
     )
     logger.info("=" * 80)
 

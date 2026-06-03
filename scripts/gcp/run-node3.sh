@@ -15,7 +15,7 @@ NODE3_COMPOSE_DIR="$(dirname "${NODE3_COMPOSE_FILE}")"
 NODE3_WAIT_FOR_SILVER_SECONDS="${NODE3_WAIT_FOR_SILVER_SECONDS:-600}"
 NODE3_WAIT_FOR_SILVER_INTERVAL_SECONDS="${NODE3_WAIT_FOR_SILVER_INTERVAL_SECONDS:-15}"
 NODE3_MIN_SILVER_OBJECTS="${NODE3_MIN_SILVER_OBJECTS:-100}"
-NODE3_GCLOUD_STORAGE_TIMEOUT_SECONDS="${NODE3_GCLOUD_STORAGE_TIMEOUT_SECONDS:-60}"
+NODE3_GCLOUD_STORAGE_TIMEOUT_SECONDS="${NODE3_GCLOUD_STORAGE_TIMEOUT_SECONDS:-300}"
 NODE3_RESET_LOCAL_SILVER_SNAPSHOT="${NODE3_RESET_LOCAL_SILVER_SNAPSHOT:-false}"
 NODE3_RUN_BATCH_PIPELINE="${NODE3_RUN_BATCH_PIPELINE:-true}"
 NODE3_LOG_DIR="${PROJECT_ROOT}/logs"
@@ -299,8 +299,10 @@ write_silver_manifest() {
     gcloud storage ls -l -r "${silver_prefix}**" \
       | awk '/^[[:space:]]*[0-9]+[[:space:]]+/ {print $1 " " $2 " " $3}' \
       | sort > "${NODE3_CURRENT_SILVER_MANIFEST}"; then
-    echo "ERROR: Could not build Silver object manifest from ${silver_prefix}."
-    exit 1
+    echo "WARNING: Could not build Silver object manifest from ${silver_prefix} within ${NODE3_GCLOUD_STORAGE_TIMEOUT_SECONDS}s."
+    echo "WARNING: Continuing with retrain so the Airflow loop is not blocked by the freshness check."
+    rm -f "${NODE3_CURRENT_SILVER_MANIFEST}"
+    return 1
   fi
 
   local object_count
@@ -310,10 +312,13 @@ write_silver_manifest() {
     exit 1
   fi
   echo "Silver manifest contains ${object_count} objects."
+  return 0
 }
 
 silver_manifest_unchanged_since_last_success() {
-  write_silver_manifest
+  if ! write_silver_manifest; then
+    return 1
+  fi
   if [ -s "${NODE3_LAST_SILVER_MANIFEST}" ] && cmp -s "${NODE3_CURRENT_SILVER_MANIFEST}" "${NODE3_LAST_SILVER_MANIFEST}"; then
     echo "No new Silver data since the last successful retrain. Skipping Spark and H2O for this schedule tick."
     return 0
@@ -328,10 +333,33 @@ silver_manifest_unchanged_since_last_success() {
 }
 
 mark_silver_manifest_processed() {
+  if [ ! -s "${NODE3_CURRENT_SILVER_MANIFEST}" ]; then
+    echo "Silver manifest was unavailable for this run. Skipping manifest watermark update."
+    return 0
+  fi
   mkdir -p "${NODE3_STATE_DIR}"
   cp "${NODE3_CURRENT_SILVER_MANIFEST}" "${NODE3_LAST_SILVER_MANIFEST}"
   date -u +%Y-%m-%dT%H:%M:%SZ > "${NODE3_STATE_DIR}/last-successful-retrain-at.txt"
   echo "Recorded Silver manifest for the successful retrain."
+}
+
+stop_stale_h2o_processes() {
+  local stale_h2o_pids
+  stale_h2o_pids="$(pgrep -f '/h2o\\.jar' || true)"
+  if [ -z "${stale_h2o_pids}" ]; then
+    echo "No stale H2O JVMs detected before retraining."
+    return 0
+  fi
+
+  echo "Stopping stale H2O JVMs before retraining: ${stale_h2o_pids}"
+  sudo kill ${stale_h2o_pids} 2>/dev/null || true
+  sleep 5
+
+  stale_h2o_pids="$(pgrep -f '/h2o\\.jar' || true)"
+  if [ -n "${stale_h2o_pids}" ]; then
+    echo "Force-stopping stubborn H2O JVMs: ${stale_h2o_pids}"
+    sudo kill -9 ${stale_h2o_pids} 2>/dev/null || true
+  fi
 }
 
 configure_cloud_sdk_runtime
@@ -494,6 +522,8 @@ if [ "${SKIP_H2O_RETRAIN}" -eq 1 ]; then
     ps
   exit 0
 fi
+
+stop_stale_h2o_processes
 
 RETRAINING_VENV="${PROJECT_ROOT}/.venv-node3"
 RETRAINING_PYTHON="${RETRAINING_VENV}/bin/python"

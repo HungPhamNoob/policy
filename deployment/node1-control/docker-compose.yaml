@@ -85,7 +85,7 @@ services:
       - ../..:/opt/traffic:ro
       - ../../data:/data:ro
       - ${GCP_SERVICE_ACCOUNT_KEY:-/dev/null}:/secrets/gcp-key.json:ro
-      - ${FASTAPI_SSH_KEY_PATH:-/home/runner/.ssh/google_compute_engine}:/run/secrets/google_compute_engine:ro
+      - ${FASTAPI_SSH_KEY_PATH:-/home/hung/.ssh/google_compute_engine}:/run/secrets/google_compute_engine:ro
     ports:
       - "8080:8080"
     command: >
@@ -144,7 +144,7 @@ services:
       - ../..:/opt/traffic:ro
       - ../../data:/data:ro
       - ${GCP_SERVICE_ACCOUNT_KEY:-/dev/null}:/secrets/gcp-key.json:ro
-      - ${FASTAPI_SSH_KEY_PATH:-/home/runner/.ssh/google_compute_engine}:/run/secrets/google_compute_engine:ro
+      - ${FASTAPI_SSH_KEY_PATH:-/home/hung/.ssh/google_compute_engine}:/run/secrets/google_compute_engine:ro
     command: >
       bash -c "
         set -euo pipefail;
@@ -335,7 +335,7 @@ services:
       - capstone-net
     volumes:
       - ../../.env.cloud:/app/.env.cloud:ro
-      - ${FASTAPI_SSH_KEY_PATH:-/home/runner/.ssh/google_compute_engine}:/run/secrets/google_compute_engine:ro
+      - ${FASTAPI_SSH_KEY_PATH:-/home/hung/.ssh/google_compute_engine}:/run/secrets/google_compute_engine:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
