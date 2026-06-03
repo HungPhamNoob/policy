@@ -20,6 +20,9 @@ from app.services.prediction_service import table_identifier
 
 LATENCY_SANITY_MAX_MS = 3_600_000.0
 EXPENSIVE_SCAN_ROW_THRESHOLD = 500_000
+_RETRAIN_LOOP_CACHE: dict[str, Any] = {}
+_RETRAIN_LOOP_CACHE_TS: float = 0.0
+_RETRAIN_LOOP_CACHE_TTL_S = 30.0
 
 
 def _prediction_table_name() -> str:
@@ -381,6 +384,129 @@ def latency(metric: str, window: str = "5m") -> dict[str, Any]:
     }
 
 
+def _compute_retrain_loop_status(
+    source_health: list[dict[str, Any]],
+    replay_rows: int,
+    settings: Any,
+) -> dict[str, Any]:
+    """Determine retrain loop CONTINUE / FINISHED / FAILED from live conditions.
+
+    CONTINUE = data is actively flowing in OR retrains scheduled by Airflow
+    FINISHED = no new data in 2x schedule window AND >=3 retrain runs completed
+    FAILED = most recent retrain run errored
+    """
+    global _RETRAIN_LOOP_CACHE, _RETRAIN_LOOP_CACHE_TS
+    now_ts = datetime.now(timezone.utc).timestamp()
+    if _RETRAIN_LOOP_CACHE and (now_ts - _RETRAIN_LOOP_CACHE_TS) < _RETRAIN_LOOP_CACHE_TTL_S:
+        return _RETRAIN_LOOP_CACHE
+
+    # Parse Airflow schedule window
+    schedule_str = os.getenv("AIRFLOW_MODEL_RETRAIN_SCHEDULE", "*/15 * * * *")
+    match = re.fullmatch(r"\*/(\d+)\s+\*\s+\*\s+\*\s+\*", schedule_str)
+    airflow_schedule_minutes = int(match.group(1)) if match else 15
+    data_stale_window_seconds = airflow_schedule_minutes * 120  # 2x schedule
+
+    # Latest event time across prediction sources
+    latest_event_time: datetime | None = None
+    for source in source_health:
+        et_str = source.get("latest_event_time")
+        if et_str:
+            try:
+                et = datetime.fromisoformat(et_str)
+                if latest_event_time is None or et > latest_event_time:
+                    latest_event_time = et
+            except (ValueError, TypeError):
+                pass
+
+    now = datetime.now(timezone.utc)
+    has_data = replay_rows > 0
+    data_is_stale = False
+    if latest_event_time is not None:
+        data_is_stale = (now - latest_event_time).total_seconds() > data_stale_window_seconds
+
+    # Quick check: if data is clearly flowing, return CONTINUE immediately
+    if has_data and not data_is_stale:
+        result = {
+            "status": "continue",
+            "reason": (
+                f"Data is actively flowing. "
+                f"Latest event: {latest_event_time.isoformat() if latest_event_time else 'N/A'}."
+            ),
+            "latest_event_time": latest_event_time.isoformat() if latest_event_time else None,
+            "schedule_window_minutes": airflow_schedule_minutes * 2,
+            "mlflow_available": True,
+            "has_data": True,
+            "data_is_stale": False,
+            "recent_retrain_runs": -1,
+        }
+        _RETRAIN_LOOP_CACHE = result
+        _RETRAIN_LOOP_CACHE_TS = now_ts
+        return result
+
+    # Check MLflow retrain runs (cached more aggressively)
+    recent_failed = False
+    recent_runs_count = 0
+    mlflow_available = False
+    try:
+        import mlflow
+        mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
+        experiment = mlflow.get_experiment_by_name(settings.mlflow_experiment_name)
+        if experiment is not None:
+            runs = mlflow.search_runs(
+                experiment_ids=[experiment.experiment_id],
+                max_results=10,
+                order_by=["start_time DESC"],
+            )
+            recent_runs_count = len(runs)
+            for _, row in runs.iterrows():
+                if str(row.get("status", "")).upper() == "FAILED":
+                    recent_failed = True
+                    break
+            mlflow_available = True
+    except Exception:
+        pass
+
+    # Determine loop status
+    if not has_data:
+        if recent_failed:
+            loop_status = "failed"
+            loop_reason = "No prediction data and most recent retrain run failed."
+        else:
+            loop_status = "continue"
+            loop_reason = "Waiting for initial data replay to begin. Replay events = 0."
+    elif data_is_stale and recent_runs_count >= 3 and not recent_failed:
+        loop_status = "finished"
+        loop_reason = (
+            f"No new events in {airflow_schedule_minutes * 2} minutes "
+            f"(latest: {latest_event_time.isoformat() if latest_event_time else 'N/A'}). "
+            f"{recent_runs_count} retrain runs completed."
+        )
+    elif recent_failed:
+        loop_status = "failed"
+        loop_reason = "Most recent retrain run FAILED. Airflow will retry on next tick."
+    else:
+        loop_status = "continue"
+        loop_reason = (
+            f"Retrains scheduled every {airflow_schedule_minutes} min. "
+            f"Events: {replay_rows:,}. "
+            f"Latest: {latest_event_time.isoformat() if latest_event_time else 'N/A'}."
+        )
+
+    result = {
+        "status": loop_status,
+        "reason": loop_reason,
+        "latest_event_time": latest_event_time.isoformat() if latest_event_time else None,
+        "schedule_window_minutes": airflow_schedule_minutes * 2,
+        "mlflow_available": mlflow_available,
+        "has_data": has_data,
+        "data_is_stale": data_is_stale,
+        "recent_retrain_runs": recent_runs_count,
+    }
+    _RETRAIN_LOOP_CACHE = result
+    _RETRAIN_LOOP_CACHE_TS = now_ts
+    return result
+
+
 def replay_health() -> dict[str, Any]:
     """Return recent replay and model-status metadata from the prediction table."""
     settings = get_settings()
@@ -433,7 +559,23 @@ def replay_health() -> dict[str, Any]:
             "latest_event_time": None,
             "latest_created_at": None,
             "model_status": [],
+            "retrain_min_us_rows": settings.retrain_min_us_rows,
+            "retrain_ready": False,
+            "retrain_policy": "new_silver_data_only",
+            "retrain_loop": {
+                "status": "continue",
+                "reason": "No source tables available yet.",
+                "latest_event_time": None,
+                "schedule_window_minutes": 30,
+                "mlflow_available": False,
+                "has_data": False,
+                "data_is_stale": False,
+                "recent_retrain_runs": 0,
+            },
+            "sources": source_health,
         }
+
+    retrain_loop = _compute_retrain_loop_status(source_health, replay_rows, settings)
 
     return {
         "status": "ok" if total_rows else "not_enough_data",
@@ -442,6 +584,7 @@ def replay_health() -> dict[str, Any]:
         "retrain_min_us_rows": settings.retrain_min_us_rows,
         "retrain_ready": replay_rows >= settings.retrain_min_us_rows,
         "retrain_policy": "new_silver_data_only",
+        "retrain_loop": retrain_loop,
         "sources": source_health,
     }
 

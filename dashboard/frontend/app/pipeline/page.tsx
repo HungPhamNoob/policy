@@ -106,40 +106,20 @@ export default function PipelinePage() {
   const replayRowCount = Number(
     replayPredictionSource?.row_count ?? replayData?.row_count ?? 0
   );
-  const retrainMinRows = Number(replayData?.retrain_min_us_rows || 0);
-  const retrainReady =
-    typeof replayData?.retrain_ready === "boolean"
-      ? replayData.retrain_ready
-      : retrainMinRows > 0
-        ? replayRowCount >= retrainMinRows
-        : true;
 
-  const retrainState = !retrainReady
-    ? "Waiting for data"
-    : String(latestRetrainRun?.status || "unavailable");
-  const retrainDetail = !retrainReady
-    ? `US replay: ${replayRowCount.toLocaleString()} / ${retrainMinRows.toLocaleString()}`
-    : latestRetrainRun?.start_time
+  // Retrain loop from backend's retrain_loop field (CONTINUE/FINISHED/FAILED)
+  const retrainLoop = (replayData?.retrain_loop as AnyRecord | undefined) || {};
+  const retrainLoopStatus = String(retrainLoop.status || "unavailable").toUpperCase();
+  const retrainLoopReason = String(retrainLoop.reason || "");
+  const retrainState = retrainLoopReason
+    ? retrainLoopStatus
+    : String(latestRetrainRun?.status || "unavailable").toUpperCase();
+  const retrainDetail = retrainLoopReason
+    || (latestRetrainRun?.start_time
       ? formatVietnamTimestampLabel("Last run", latestRetrainRun.start_time)
-      : "No retrain run metadata yet";
-  const retrainHistoryRows = !retrainReady
-    ? [
-        {
-          run_id: "retrain-data-gate",
-          run_name: "retrain_data_gate",
-          status: "WAITING_DATA",
-          start_time: null,
-          metrics: {}
-        },
-        ...rawRetrainRuns.filter(
-          (run) =>
-            !(
-              String(run.run_name || "") === "h2o_retrain_online" &&
-              String(run.status || "").toUpperCase() === "FAILED"
-            )
-        )
-      ]
-    : rawRetrainRuns;
+      : "No retrain run metadata yet");
+
+  const retrainHistoryRows = rawRetrainRuns;
 
   const serviceRows = [
     [
@@ -235,11 +215,7 @@ export default function PipelinePage() {
         <KpiCard
           label="Prediction rows"
           value={replayRowCount.toLocaleString()}
-          detail={
-            retrainMinRows > 0
-              ? `US replay threshold: ${retrainMinRows.toLocaleString()}`
-              : String(replayData?.retrain_policy || statusText(replayData))
-          }
+          detail={String(replayData?.retrain_policy || "new_silver_data_only")}
         />
         <KpiCard
           label="Model"
