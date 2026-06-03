@@ -28,11 +28,15 @@ APT_CACHE_UPDATED=0
 NODE3_TEMP_DIR="$(mktemp -d /tmp/node3-run-XXXXXX)"
 NODE3_SILVER_LS_STDOUT="${NODE3_TEMP_DIR}/silver-ls.txt"
 NODE3_SILVER_LS_STDERR="${NODE3_TEMP_DIR}/silver-ls.err"
-NODE3_CURRENT_SILVER_MANIFEST="${NODE3_TEMP_DIR}/silver-manifest.txt"
-NODE3_LAST_SILVER_MANIFEST="${NODE3_STATE_DIR}/last-successful-silver-manifest.txt"
 NODE3_CURRENT_SILVER_DELTA_MANIFEST="${NODE3_STATE_DIR}/current-silver-delta-manifest.txt"
-NODE3_INCREMENTAL_SYNC_MAX_FILES="${NODE3_INCREMENTAL_SYNC_MAX_FILES:-15000}"
+NODE3_CURRENT_SILVER_WATERMARK_FILE="${NODE3_STATE_DIR}/current-silver-watermark.txt"
+NODE3_LAST_SUCCESSFUL_SILVER_WATERMARK_FILE="${NODE3_STATE_DIR}/last-successful-silver-watermark.txt"
+NODE3_CURRENT_SILVER_PENDING_TOTAL_FILE="${NODE3_STATE_DIR}/current-silver-pending-total.txt"
 NODE3_RESET_LOCAL_GOLD_SNAPSHOT="${NODE3_RESET_LOCAL_GOLD_SNAPSHOT:-false}"
+NODE3_STOP_SPARK_FOR_H2O="${NODE3_STOP_SPARK_FOR_H2O:-true}"
+NODE3_LOCAL_PENDING_DELTA_COUNT=0
+NODE3_LOCAL_PENDING_TOTAL_COUNT=0
+NODE3_CURRENT_BATCH_ID=""
 
 cleanup_node3_temp() {
   rm -rf "${NODE3_TEMP_DIR}" 2>/dev/null || true
@@ -292,79 +296,109 @@ wait_for_silver_data() {
   exit 1
 }
 
-write_silver_manifest() {
-  local silver_prefix="${SILVER_FEATURES_PATH%/}/"
+build_local_silver_delta_manifest() {
   mkdir -p "${NODE3_STATE_DIR}"
-  : > "${NODE3_CURRENT_SILVER_MANIFEST}"
+  : > "${NODE3_CURRENT_SILVER_DELTA_MANIFEST}"
+  rm -f "${NODE3_CURRENT_SILVER_WATERMARK_FILE}"
+  rm -f "${NODE3_CURRENT_SILVER_PENDING_TOTAL_FILE}"
 
-  echo "Building Silver object manifest for retrain freshness checks."
-  if ! timeout "${NODE3_GCLOUD_STORAGE_TIMEOUT_SECONDS}" \
-    gcloud storage ls -l -r "${silver_prefix}**" \
-      | awk '/^[[:space:]]*[0-9]+[[:space:]]+/ {print $1 " " $2 " " $3}' \
-      | sort > "${NODE3_CURRENT_SILVER_MANIFEST}"; then
-    echo "WARNING: Could not build Silver object manifest from ${silver_prefix} within ${NODE3_GCLOUD_STORAGE_TIMEOUT_SECONDS}s."
-    echo "WARNING: Continuing with retrain so the Airflow loop is not blocked by the freshness check."
-    rm -f "${NODE3_CURRENT_SILVER_MANIFEST}"
+  if ! python3 - \
+    "${LOCAL_SILVER_FEATURES_PATH}" \
+    "${SPARK_LOCAL_SILVER_FEATURES_PATH}" \
+    "${NODE3_CURRENT_SILVER_DELTA_MANIFEST}" \
+    "${NODE3_CURRENT_SILVER_WATERMARK_FILE}" \
+    "${NODE3_LAST_SUCCESSFUL_SILVER_WATERMARK_FILE}" \
+    "${NODE3_CURRENT_SILVER_PENDING_TOTAL_FILE}" \
+    "${NODE3_DELTA_BATCH_MAX_FILES:-${SPARK_INCREMENTAL_MAX_FILES:-15000}}" <<'PY'; then
+import sys
+import re
+from pathlib import Path
+
+local_root = Path(sys.argv[1])
+spark_root = sys.argv[2].rstrip("/")
+delta_manifest = Path(sys.argv[3])
+watermark_file = Path(sys.argv[4])
+last_successful_watermark_file = Path(sys.argv[5])
+pending_total_file = Path(sys.argv[6])
+batch_limit = int(sys.argv[7])
+
+last_successful_watermark = ""
+if last_successful_watermark_file.exists():
+    last_successful_watermark = (
+        last_successful_watermark_file.read_text(encoding="utf-8").strip()
+    )
+
+pattern = re.compile(r"features-(\d{8}T\d+Z)\.jsonl$")
+entries = []
+max_stamp = ""
+
+if local_root.exists():
+    for path in local_root.rglob("features-*.jsonl"):
+        match = pattern.match(path.name)
+        if not match:
+            continue
+        stamp = match.group(1)
+        if last_successful_watermark and stamp <= last_successful_watermark:
+            continue
+        relative_path = path.relative_to(local_root).as_posix()
+        entries.append((stamp, f"{spark_root}/{relative_path}"))
+        if stamp > max_stamp:
+            max_stamp = stamp
+
+entries.sort()
+total_pending = len(entries)
+selected_entries = entries[:batch_limit] if batch_limit > 0 else entries
+delta_manifest.write_text(
+    "\n".join(local_path for _, local_path in selected_entries)
+    + ("\n" if selected_entries else ""),
+    encoding="utf-8",
+)
+pending_total_file.write_text(str(total_pending) + "\n", encoding="utf-8")
+if selected_entries:
+    watermark_file.write_text(selected_entries[-1][0] + "\n", encoding="utf-8")
+print(len(selected_entries))
+PY
+    echo "WARNING: Failed to compute the local Silver delta manifest."
     return 1
   fi
 
-  local object_count
-  object_count="$(wc -l < "${NODE3_CURRENT_SILVER_MANIFEST}" | tr -d ' ')"
-  if [ "${object_count}" -eq 0 ]; then
-    echo "ERROR: Silver manifest is empty even though the prefix was visible."
-    exit 1
+  NODE3_LOCAL_PENDING_DELTA_COUNT="$(wc -l < "${NODE3_CURRENT_SILVER_DELTA_MANIFEST}" | tr -d ' ')"
+  if [ -f "${NODE3_CURRENT_SILVER_PENDING_TOTAL_FILE}" ]; then
+    NODE3_LOCAL_PENDING_TOTAL_COUNT="$(tr -d ' \n\r' < "${NODE3_CURRENT_SILVER_PENDING_TOTAL_FILE}")"
+  else
+    NODE3_LOCAL_PENDING_TOTAL_COUNT="${NODE3_LOCAL_PENDING_DELTA_COUNT}"
   fi
-  echo "Silver manifest contains ${object_count} objects."
+  if [ "${NODE3_LOCAL_PENDING_DELTA_COUNT}" -gt 0 ]; then
+    echo "Silver delta manifest selected ${NODE3_LOCAL_PENDING_DELTA_COUNT} files for this retrain tick out of ${NODE3_LOCAL_PENDING_TOTAL_COUNT} pending local files newer than the last successful retrain watermark."
+  else
+    echo "No local Silver backlog exists beyond the last successful retrain watermark."
+  fi
+}
+
+silver_snapshot_unchanged_since_last_success() {
+  if ! build_local_silver_delta_manifest; then
+    echo "Silver delta check failed before sync. Continuing with an incremental rsync so this schedule tick can still recover."
+    return 1
+  fi
+
+  if [ "${NODE3_LOCAL_PENDING_DELTA_COUNT}" -gt 0 ]; then
+    echo "Detected local Silver backlog that has not yet been retrained. Continuing with Spark and H2O."
+    return 1
+  fi
+
+  echo "No local Silver backlog is waiting. A remote incremental rsync will confirm whether new data arrived for this schedule tick."
   return 0
 }
 
-silver_manifest_unchanged_since_last_success() {
-  if ! write_silver_manifest; then
-    return 1
-  fi
-  if [ -s "${NODE3_LAST_SILVER_MANIFEST}" ] && cmp -s "${NODE3_CURRENT_SILVER_MANIFEST}" "${NODE3_LAST_SILVER_MANIFEST}"; then
-    echo "No new Silver data since the last successful retrain. Skipping Spark and H2O for this schedule tick."
-    return 0
-  fi
-
-  if [ -s "${NODE3_LAST_SILVER_MANIFEST}" ]; then
-    echo "Silver data changed since the last successful retrain. Continuing with Spark and H2O."
-  else
-    echo "No previous successful Silver manifest exists. Running the first retrain for this replay."
-  fi
-  return 1
-}
-
-mark_silver_manifest_processed() {
-  if [ ! -s "${NODE3_CURRENT_SILVER_MANIFEST}" ]; then
-    echo "Silver manifest was unavailable for this run. Skipping manifest watermark update."
+mark_silver_watermark_processed() {
+  if [ ! -s "${NODE3_CURRENT_SILVER_WATERMARK_FILE}" ]; then
+    echo "No current Silver watermark was recorded for this run. Skipping watermark update."
     return 0
   fi
   mkdir -p "${NODE3_STATE_DIR}"
-  cp "${NODE3_CURRENT_SILVER_MANIFEST}" "${NODE3_LAST_SILVER_MANIFEST}"
+  cp "${NODE3_CURRENT_SILVER_WATERMARK_FILE}" "${NODE3_LAST_SUCCESSFUL_SILVER_WATERMARK_FILE}"
   date -u +%Y-%m-%dT%H:%M:%SZ > "${NODE3_STATE_DIR}/last-successful-retrain-at.txt"
-  echo "Recorded Silver manifest for the successful retrain."
-}
-
-write_silver_delta_manifest() {
-  mkdir -p "${NODE3_STATE_DIR}"
-  : > "${NODE3_CURRENT_SILVER_DELTA_MANIFEST}"
-
-  if [ ! -s "${NODE3_CURRENT_SILVER_MANIFEST}" ]; then
-    echo "Silver delta manifest cannot be built because the current Silver manifest is unavailable."
-    return 1
-  fi
-
-  if [ -s "${NODE3_LAST_SILVER_MANIFEST}" ]; then
-    comm -13 "${NODE3_LAST_SILVER_MANIFEST}" "${NODE3_CURRENT_SILVER_MANIFEST}" \
-      | awk '{print $3}' > "${NODE3_CURRENT_SILVER_DELTA_MANIFEST}"
-  else
-    awk '{print $3}' "${NODE3_CURRENT_SILVER_MANIFEST}" > "${NODE3_CURRENT_SILVER_DELTA_MANIFEST}"
-  fi
-
-  local delta_count
-  delta_count="$(wc -l < "${NODE3_CURRENT_SILVER_DELTA_MANIFEST}" | tr -d ' ')"
-  echo "Silver delta manifest contains ${delta_count} objects."
+  echo "Recorded the Silver watermark for the successful retrain."
 }
 
 stop_stale_h2o_processes() {
@@ -412,35 +446,26 @@ bootstrap_local_gold_snapshot() {
 }
 
 sync_silver_snapshot() {
-  local delta_count=0
-  if [ -s "${NODE3_CURRENT_SILVER_DELTA_MANIFEST}" ]; then
-    delta_count="$(wc -l < "${NODE3_CURRENT_SILVER_DELTA_MANIFEST}" | tr -d ' ')"
-  fi
-
-  if [ "${delta_count}" -gt 0 ] && [ "${delta_count}" -le "${NODE3_INCREMENTAL_SYNC_MAX_FILES}" ]; then
-    echo "Syncing ${delta_count} changed Silver objects into the local snapshot."
-    while IFS= read -r object_path; do
-      [ -n "${object_path}" ] || continue
-      local relative_path
-      local local_target
-      relative_path="${object_path#${SILVER_FEATURES_PATH%/}/}"
-      local_target="${LOCAL_SILVER_FEATURES_PATH%/}/${relative_path}"
-      mkdir -p "$(dirname "${local_target}")"
-      gcloud storage cp "${object_path}" "${local_target}" >/dev/null
-    done < "${NODE3_CURRENT_SILVER_DELTA_MANIFEST}"
-    return 0
-  fi
-
-  if [ "${delta_count}" -gt "${NODE3_INCREMENTAL_SYNC_MAX_FILES}" ]; then
-    echo "Silver delta is too large for per-file incremental sync (${delta_count} files > ${NODE3_INCREMENTAL_SYNC_MAX_FILES}). Falling back to full rsync."
-  else
-    echo "Silver delta manifest is unavailable. Falling back to full rsync."
-  fi
+  echo "Running an incremental Silver rsync from GCS into the local snapshot."
 
   if ! gcloud storage rsync -r "${SILVER_FEATURES_PATH}" "${LOCAL_SILVER_FEATURES_PATH}"; then
     echo "WARNING: Silver rsync reported transient copy errors while streaming was active."
     echo "WARNING: Continuing with the files that were copied into the local snapshot."
   fi
+}
+
+stop_spark_services_for_h2o() {
+  if [ "${NODE3_STOP_SPARK_FOR_H2O}" != "true" ]; then
+    echo "Keeping Spark services running during H2O retraining."
+    return 0
+  fi
+
+  echo "Stopping Spark services to free RAM for H2O retraining."
+  compose_cmd \
+    --project-directory "${NODE3_COMPOSE_DIR}" \
+    --env-file "${ENV_FILE}" \
+    -f "${NODE3_COMPOSE_FILE}" \
+    stop spark-worker-1 spark-worker-2 spark-worker-3 spark-master || true
 }
 
 configure_cloud_sdk_runtime
@@ -494,19 +519,20 @@ LOCAL_SILVER_FEATURES_PATH="${LOCAL_SILVER_FEATURES_PATH:-${LOCAL_CLOUD_DATA_DIR
 LOCAL_GOLD_RETRAIN_PATH="${LOCAL_GOLD_RETRAIN_PATH:-${LOCAL_CLOUD_DATA_DIR}/gold/features/retrain}"
 LOCAL_GOLD_RETRAIN_PARQUET_PATH="${LOCAL_GOLD_RETRAIN_PARQUET_PATH:-${LOCAL_GOLD_RETRAIN_PATH}/parquet}"
 LOCAL_GOLD_RETRAIN_CSV_PATH="${LOCAL_GOLD_RETRAIN_CSV_PATH:-${LOCAL_GOLD_RETRAIN_PATH}/csv}"
+SPARK_LOCAL_SILVER_FEATURES_PATH="${SPARK_LOCAL_SILVER_FEATURES_PATH:-/data/cloud/silver/flink_features}"
+export LOCAL_SILVER_FEATURES_PATH
+export SPARK_LOCAL_SILVER_FEATURES_PATH
+export NODE3_CURRENT_SILVER_DELTA_MANIFEST
+export NODE3_CURRENT_SILVER_WATERMARK_FILE
+export NODE3_LAST_SUCCESSFUL_SILVER_WATERMARK_FILE
 
 wait_for_silver_data
 
-if silver_manifest_unchanged_since_last_success; then
-  compose_cmd \
-    --project-directory "${NODE3_COMPOSE_DIR}" \
-    --env-file "${ENV_FILE}" \
-    -f "${NODE3_COMPOSE_FILE}" \
-    ps
-  exit 0
-fi
+mkdir -p "${LOCAL_SILVER_FEATURES_PATH}" "${LOCAL_GOLD_RETRAIN_PATH}"
 
-write_silver_delta_manifest || true
+if silver_snapshot_unchanged_since_last_success; then
+  echo "No unretrained local backlog was found before sync."
+fi
 
 echo "Syncing Silver data from GCS to local disk for Spark processing."
 echo "GCS Silver:   ${SILVER_FEATURES_PATH}"
@@ -522,8 +548,30 @@ else
   echo "Preserving the existing local Silver snapshot so rsync can continue incrementally."
 fi
 
-mkdir -p "${LOCAL_SILVER_FEATURES_PATH}" "${LOCAL_GOLD_RETRAIN_PATH}"
-sync_silver_snapshot
+if [ "${NODE3_LOCAL_PENDING_DELTA_COUNT}" -gt 0 ]; then
+  echo "Skipping the remote Silver rsync for this tick because a large unretrained local backlog already exists."
+  echo "The next scheduled retrain will pull additional remote Silver files after this backlog is consumed."
+else
+  sync_silver_snapshot
+  build_local_silver_delta_manifest
+fi
+
+if [ "${NODE3_LOCAL_PENDING_DELTA_COUNT}" -eq 0 ]; then
+  echo "No new Silver data since the last successful retrain. Skipping Spark and H2O for this schedule tick."
+  compose_cmd \
+    --project-directory "${NODE3_COMPOSE_DIR}" \
+    --env-file "${ENV_FILE}" \
+    -f "${NODE3_COMPOSE_FILE}" \
+    ps
+  exit 0
+fi
+
+if [ -s "${NODE3_CURRENT_SILVER_WATERMARK_FILE}" ]; then
+  NODE3_CURRENT_BATCH_ID="$(tr -d ' \n\r' < "${NODE3_CURRENT_SILVER_WATERMARK_FILE}")"
+else
+  NODE3_CURRENT_BATCH_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+fi
+echo "Current retrain batch ID: ${NODE3_CURRENT_BATCH_ID}"
 
 LOCAL_SILVER_SAMPLE_FILE="$(find "${LOCAL_SILVER_FEATURES_PATH}" -type f -print -quit)"
 if [ -z "${LOCAL_SILVER_SAMPLE_FILE}" ]; then
@@ -555,6 +603,7 @@ compose_cmd \
   env \
   SILVER_FEATURES_PATH=/data/cloud/silver/flink_features \
   SILVER_DELTA_MANIFEST_PATH=/opt/traffic/logs/retrain_state/current-silver-delta-manifest.txt \
+  SPARK_BATCH_ID="${NODE3_CURRENT_BATCH_ID}" \
   EXISTING_GOLD_PARQUET_PATH=/data/cloud/gold/features/retrain/parquet \
   GOLD_RETRAIN_PATH=/data/cloud/gold/features/retrain \
   GOLD_RETRAIN_PARQUET_PATH=/data/cloud/gold/features/retrain/parquet \
@@ -562,11 +611,13 @@ compose_cmd \
   SPARK_INCREMENTAL_MAX_FILES="${SPARK_INCREMENTAL_MAX_FILES:-10000}" \
   /opt/spark/bin/spark-submit \
   --master spark://spark-master:7077 \
+  --driver-memory "${SPARK_DRIVER_MEMORY:-1536m}" \
   /opt/traffic/processing/spark_batch.py
 
 echo "Syncing Gold Parquet and CSV outputs back to GCS."
 gcloud storage rsync -r "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}" "${GOLD_RETRAIN_PARQUET_PATH}"
 gcloud storage rsync -r "${LOCAL_GOLD_RETRAIN_CSV_PATH}" "${GOLD_RETRAIN_CSV_PATH}"
+stop_spark_services_for_h2o
 
 echo "Running online H2O retraining once from the latest gold data."
 SKIP_H2O_RETRAIN=0
@@ -658,7 +709,7 @@ H2O_MAX_RUNTIME="${NODE3_H2O_MAX_RUNTIME:-${H2O_MAX_RUNTIME:-600}}" \
   RETRAIN_DATA_PATH="${LOCAL_GOLD_RETRAIN_CSV_PATH}" \
   "${RETRAINING_PYTHON}" ml/training/h2o_after_2020.py
 
-mark_silver_manifest_processed
+mark_silver_watermark_processed
 
 echo "Node 3 services:"
 compose_cmd \

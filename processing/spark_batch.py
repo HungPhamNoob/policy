@@ -61,6 +61,7 @@ EXISTING_GOLD_PARQUET_PATH = os.getenv(
 )
 SILVER_DELTA_MANIFEST_PATH = os.getenv("SILVER_DELTA_MANIFEST_PATH", "")
 SPARK_INCREMENTAL_MAX_FILES = int(os.getenv("SPARK_INCREMENTAL_MAX_FILES", "10000"))
+SPARK_BATCH_ID = os.getenv("SPARK_BATCH_ID", "").strip()
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -231,6 +232,15 @@ def should_run_incremental(delta_paths):
     return True
 
 
+def build_incremental_output_paths():
+    batch_id = SPARK_BATCH_ID or "manual-batch"
+    parquet_output_path = (
+        f"{GOLD_RETRAIN_PARQUET_PATH.rstrip('/')}/incremental_batches/{batch_id}"
+    )
+    csv_output_path = f"{GOLD_RETRAIN_CSV_PATH.rstrip('/')}/incremental_batches/{batch_id}"
+    return parquet_output_path, csv_output_path
+
+
 def main() -> None:
     logger.info("=" * 80)
     logger.info("Spark Silver -> Gold Parquet Job")
@@ -259,30 +269,23 @@ def main() -> None:
         incremental_mode = should_run_incremental(delta_paths)
 
         if incremental_mode:
-            logger.info("Running incremental Gold rebuild from existing Gold + new Silver delta.")
-            existing_gold_df = spark.read.parquet(EXISTING_GOLD_PARQUET_PATH).select(
-                *FEATURE_COLUMNS
+            logger.info(
+                "Running incremental Gold append from the new Silver delta only."
             )
-            existing_gold_df = existing_gold_df.cache()
-            existing_gold_count = existing_gold_df.count()
-            logger.info("Existing Gold rows available locally: %s", f"{existing_gold_count:,}")
-
             delta_df, total_raw, delta_clean_count = build_clean_feature_df(spark, delta_paths)
             if total_raw == 0:
                 logger.warning(
                     "Delta Silver files produced no valid rows. Keeping the existing Gold snapshot."
                 )
-                clean_df = existing_gold_df
-                final_count = existing_gold_count
+                return
             else:
-                logger.info("Unioning existing Gold rows with the new Silver delta.")
-                clean_df = (
-                    existing_gold_df.unionByName(delta_df.select(*FEATURE_COLUMNS))
-                    .dropDuplicates(["event_id"])
-                    .cache()
-                )
+                clean_df = delta_df.select(*FEATURE_COLUMNS).cache()
                 final_count = clean_df.count()
-                logger.info("Final cumulative Gold rows: %s", f"{final_count:,}")
+                logger.info(
+                    "Rows ready for incremental Gold append in batch %s: %s",
+                    SPARK_BATCH_ID or "manual-batch",
+                    f"{final_count:,}",
+                )
         else:
             logger.info("Running full Gold rebuild from the complete Silver snapshot.")
             clean_df, total_raw, final_count = build_clean_feature_df(spark)
@@ -300,15 +303,31 @@ def main() -> None:
             logger.warning("No valid rows remain after cleaning. Exiting.")
             return
 
-        partitioned_df.write.mode("overwrite").partitionBy("event_year").parquet(
-            GOLD_RETRAIN_PARQUET_PATH
-        )
-        partitioned_df.write.mode("overwrite").option("header", "true").csv(
-            GOLD_RETRAIN_CSV_PATH
-        )
-
-        logger.info("Gold Parquet written to: %s", GOLD_RETRAIN_PARQUET_PATH)
-        logger.info("Gold CSV written to:     %s", GOLD_RETRAIN_CSV_PATH)
+        if incremental_mode:
+            parquet_output_path, csv_output_path = build_incremental_output_paths()
+            logger.info(
+                "Writing incremental Gold batch %s to Parquet=%s CSV=%s",
+                SPARK_BATCH_ID or "manual-batch",
+                parquet_output_path,
+                csv_output_path,
+            )
+            partitioned_df.write.mode("overwrite").partitionBy("event_year").parquet(
+                parquet_output_path
+            )
+            partitioned_df.write.mode("overwrite").option("header", "true").csv(
+                csv_output_path
+            )
+            logger.info("Incremental Gold Parquet batch written to: %s", parquet_output_path)
+            logger.info("Incremental Gold CSV batch written to:     %s", csv_output_path)
+        else:
+            partitioned_df.write.mode("overwrite").partitionBy("event_year").parquet(
+                GOLD_RETRAIN_PARQUET_PATH
+            )
+            partitioned_df.write.mode("overwrite").option("header", "true").csv(
+                GOLD_RETRAIN_CSV_PATH
+            )
+            logger.info("Gold Parquet written to: %s", GOLD_RETRAIN_PARQUET_PATH)
+            logger.info("Gold CSV written to:     %s", GOLD_RETRAIN_CSV_PATH)
 
     finally:
         spark.stop()

@@ -28,6 +28,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
+from typing import Sequence
 
 import h2o
 from h2o.automl import H2OAutoML
@@ -305,7 +306,7 @@ def build_class_sampling_factors(label_distribution) -> tuple[list[float] | None
 # ============================================================
 # Find latest retrain data on GCS
 # ============================================================
-def find_latest_data(data_root: str) -> str:
+def find_latest_data(data_root: str) -> str | list[str]:
     """
     Find the most recent retrain data directory or file.
 
@@ -331,7 +332,7 @@ def find_latest_data(data_root: str) -> str:
                     data_root,
                     len(candidate_files),
                 )
-                return data_root
+                return [str(path) for path in candidate_files]
             logger.warning(
                 "Local retrain directory exists but contains no CSV or Parquet files: %s",
                 data_root,
@@ -395,7 +396,12 @@ def main():
     logger.info("=" * 80)
     logger.info("H2O AutoML Retraining - Online / Incremental")
     logger.info("=" * 80)
-    logger.info("Data path:               %s", data_path)
+    if isinstance(data_path, Sequence) and not isinstance(data_path, str):
+        logger.info("Data files discovered:   %s", len(data_path))
+        logger.info("Newest retrain file:     %s", data_path[-1] if data_path else "(none)")
+        logger.info("Oldest retrain file:     %s", data_path[0] if data_path else "(none)")
+    else:
+        logger.info("Data path:               %s", data_path)
     logger.info("MLflow tracking URI:     %s", MLFLOW_TRACKING_URI)
     logger.info("MLflow experiment:       %s", MLFLOW_EXPERIMENT_NAME)
     logger.info("Registered model name:   %s", MODEL_NAME)
