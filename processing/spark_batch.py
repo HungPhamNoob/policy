@@ -18,6 +18,7 @@ This job is triggered by the Airflow model_retrain_hourly DAG.
 
 import logging
 import os
+from pathlib import Path
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -54,6 +55,12 @@ GOLD_RETRAIN_CSV_PATH = os.getenv(
 
 WRITE_PARTITIONS = int(os.getenv("SPARK_WRITE_PARTITIONS", "4"))
 READ_PARTITIONS = int(os.getenv("SPARK_READ_PARTITIONS", "64"))
+EXISTING_GOLD_PARQUET_PATH = os.getenv(
+    "EXISTING_GOLD_PARQUET_PATH",
+    GOLD_RETRAIN_PARQUET_PATH,
+)
+SILVER_DELTA_MANIFEST_PATH = os.getenv("SILVER_DELTA_MANIFEST_PATH", "")
+SPARK_INCREMENTAL_MAX_FILES = int(os.getenv("SPARK_INCREMENTAL_MAX_FILES", "10000"))
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -129,10 +136,99 @@ FILL_DEFAULTS = {
     "is_night": 0,
 }
 
+FEATURE_COLUMNS = [field.name for field in FEATURE_SCHEMA]
+
 
 # ---------------------------------------------------------------------------
 # Main job
 # ---------------------------------------------------------------------------
+
+
+def build_clean_feature_df(spark: SparkSession, input_paths=None):
+    reader = (
+        spark.read.option("recursiveFileLookup", "true")
+        .schema(FEATURE_SCHEMA)
+        .option("mode", "PERMISSIVE")
+    )
+
+    if input_paths:
+        raw_df = reader.json(input_paths)
+    else:
+        raw_df = reader.json(SILVER_PATH)
+
+    if READ_PARTITIONS > 0:
+        raw_df = raw_df.coalesce(READ_PARTITIONS)
+
+    if not raw_df.take(1):
+        logger.warning("No Silver data found for this Spark run.")
+        return raw_df, 0, 0
+
+    logger.info("Dropping rows with missing required fields ...")
+    clean_df = raw_df.dropna(subset=REQUIRED_COLUMNS)
+
+    logger.info("Filtering to valid severity (1-4) and coordinate ranges ...")
+    clean_df = (
+        clean_df.filter(F.col("true_severity").between(1, 4))
+        .filter(F.col("lat").between(-90, 90))
+        .filter(F.col("lon").between(-180, 180))
+    )
+
+    logger.info("Filling null feature columns with sensible defaults ...")
+    clean_df = clean_df.fillna(FILL_DEFAULTS)
+
+    logger.info("Deduplicating by event_id ...")
+    clean_df = clean_df.dropDuplicates(["event_id"])
+
+    return clean_df, -1, -1
+
+
+def load_delta_paths():
+    if not SILVER_DELTA_MANIFEST_PATH:
+        return []
+
+    manifest_path = Path(SILVER_DELTA_MANIFEST_PATH)
+    if not manifest_path.exists():
+        logger.info("Silver delta manifest does not exist: %s", manifest_path)
+        return []
+
+    delta_paths = [
+        line.strip()
+        for line in manifest_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    logger.info("Silver delta manifest contains %s candidate files.", len(delta_paths))
+    return delta_paths
+
+
+def should_run_incremental(delta_paths):
+    if not delta_paths:
+        logger.info("Incremental Spark disabled because no delta manifest was provided.")
+        return False
+
+    if len(delta_paths) > SPARK_INCREMENTAL_MAX_FILES:
+        logger.info(
+            "Incremental Spark disabled because %s delta files exceed the limit of %s.",
+            len(delta_paths),
+            SPARK_INCREMENTAL_MAX_FILES,
+        )
+        return False
+
+    gold_path = Path(EXISTING_GOLD_PARQUET_PATH)
+    if not gold_path.exists():
+        logger.info(
+            "Incremental Spark disabled because the existing Gold Parquet path does not exist: %s",
+            EXISTING_GOLD_PARQUET_PATH,
+        )
+        return False
+
+    if not any(gold_path.rglob("*.parquet")):
+        logger.info(
+            "Incremental Spark disabled because no Parquet files were found under %s",
+            EXISTING_GOLD_PARQUET_PATH,
+        )
+        return False
+
+    return True
 
 
 def main() -> None:
@@ -141,8 +237,11 @@ def main() -> None:
     logger.info("Silver path:       %s", SILVER_PATH)
     logger.info("Gold Parquet path: %s", GOLD_RETRAIN_PARQUET_PATH)
     logger.info("Gold CSV path:     %s", GOLD_RETRAIN_CSV_PATH)
+    logger.info("Existing Gold:     %s", EXISTING_GOLD_PARQUET_PATH)
+    logger.info("Silver delta file: %s", SILVER_DELTA_MANIFEST_PATH or "(not set)")
     logger.info("Read partitions:   %s", READ_PARTITIONS)
     logger.info("Write partitions:  %s", WRITE_PARTITIONS)
+    logger.info("Incremental limit: %s files", SPARK_INCREMENTAL_MAX_FILES)
     logger.info("=" * 80)
 
     spark = (
@@ -153,49 +252,53 @@ def main() -> None:
         .config("spark.sql.session.timeZone", "UTC")
         .getOrCreate()
     )
+    spark.sparkContext.setLogLevel("WARN")
 
     try:
-        logger.info("Reading Silver JSONL files recursively from GCS ...")
-        raw_df = (
-            spark.read.option("recursiveFileLookup", "true")
-            .schema(FEATURE_SCHEMA)
-            .json(SILVER_PATH)
-        )
-        if READ_PARTITIONS > 0:
-            raw_df = raw_df.coalesce(READ_PARTITIONS)
+        delta_paths = load_delta_paths()
+        incremental_mode = should_run_incremental(delta_paths)
 
-        total_raw = raw_df.count()
-        logger.info("Raw records read: %s", f"{total_raw:,}")
+        if incremental_mode:
+            logger.info("Running incremental Gold rebuild from existing Gold + new Silver delta.")
+            existing_gold_df = spark.read.parquet(EXISTING_GOLD_PARQUET_PATH).select(
+                *FEATURE_COLUMNS
+            )
+            existing_gold_df = existing_gold_df.cache()
+            existing_gold_count = existing_gold_df.count()
+            logger.info("Existing Gold rows available locally: %s", f"{existing_gold_count:,}")
 
-        if total_raw == 0:
-            logger.warning("No Silver data found. Exiting without writing Gold output.")
-            return
+            delta_df, total_raw, delta_clean_count = build_clean_feature_df(spark, delta_paths)
+            if total_raw == 0:
+                logger.warning(
+                    "Delta Silver files produced no valid rows. Keeping the existing Gold snapshot."
+                )
+                clean_df = existing_gold_df
+                final_count = existing_gold_count
+            else:
+                logger.info("Unioning existing Gold rows with the new Silver delta.")
+                clean_df = (
+                    existing_gold_df.unionByName(delta_df.select(*FEATURE_COLUMNS))
+                    .dropDuplicates(["event_id"])
+                    .cache()
+                )
+                final_count = clean_df.count()
+                logger.info("Final cumulative Gold rows: %s", f"{final_count:,}")
+        else:
+            logger.info("Running full Gold rebuild from the complete Silver snapshot.")
+            clean_df, total_raw, final_count = build_clean_feature_df(spark)
 
-        logger.info("Dropping rows with missing required fields ...")
-        clean_df = raw_df.dropna(subset=REQUIRED_COLUMNS)
-
-        logger.info("Filtering to valid severity (1-4) and coordinate ranges ...")
-        clean_df = (
-            clean_df.filter(F.col("true_severity").between(1, 4))
-            .filter(F.col("lat").between(-90, 90))
-            .filter(F.col("lon").between(-180, 180))
-        )
-
-        logger.info("Filling null feature columns with sensible defaults ...")
-        clean_df = clean_df.fillna(FILL_DEFAULTS)
-
-        logger.info("Deduplicating by event_id ...")
-        clean_df = clean_df.dropDuplicates(["event_id"])
-
-        final_count = clean_df.count()
-        logger.info("Clean rows after all filters: %s", f"{final_count:,}")
-
-        if final_count == 0:
-            logger.warning("No valid rows remain after cleaning. Exiting.")
-            return
+            if total_raw == 0:
+                logger.warning("No Silver data found. Exiting without writing Gold output.")
+                return
 
         logger.info("Writing Gold Parquet and CSV outputs ...")
-        partitioned_df = clean_df.repartition(WRITE_PARTITIONS, "event_year")
+        partitioned_df = clean_df.repartition(WRITE_PARTITIONS, "event_year").cache()
+        partitioned_count = partitioned_df.count()
+        logger.info("Rows ready to write: %s", f"{partitioned_count:,}")
+
+        if partitioned_count == 0:
+            logger.warning("No valid rows remain after cleaning. Exiting.")
+            return
 
         partitioned_df.write.mode("overwrite").partitionBy("event_year").parquet(
             GOLD_RETRAIN_PARQUET_PATH

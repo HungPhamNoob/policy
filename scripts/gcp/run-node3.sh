@@ -30,6 +30,9 @@ NODE3_SILVER_LS_STDOUT="${NODE3_TEMP_DIR}/silver-ls.txt"
 NODE3_SILVER_LS_STDERR="${NODE3_TEMP_DIR}/silver-ls.err"
 NODE3_CURRENT_SILVER_MANIFEST="${NODE3_TEMP_DIR}/silver-manifest.txt"
 NODE3_LAST_SILVER_MANIFEST="${NODE3_STATE_DIR}/last-successful-silver-manifest.txt"
+NODE3_CURRENT_SILVER_DELTA_MANIFEST="${NODE3_STATE_DIR}/current-silver-delta-manifest.txt"
+NODE3_INCREMENTAL_SYNC_MAX_FILES="${NODE3_INCREMENTAL_SYNC_MAX_FILES:-15000}"
+NODE3_RESET_LOCAL_GOLD_SNAPSHOT="${NODE3_RESET_LOCAL_GOLD_SNAPSHOT:-false}"
 
 cleanup_node3_temp() {
   rm -rf "${NODE3_TEMP_DIR}" 2>/dev/null || true
@@ -343,6 +346,27 @@ mark_silver_manifest_processed() {
   echo "Recorded Silver manifest for the successful retrain."
 }
 
+write_silver_delta_manifest() {
+  mkdir -p "${NODE3_STATE_DIR}"
+  : > "${NODE3_CURRENT_SILVER_DELTA_MANIFEST}"
+
+  if [ ! -s "${NODE3_CURRENT_SILVER_MANIFEST}" ]; then
+    echo "Silver delta manifest cannot be built because the current Silver manifest is unavailable."
+    return 1
+  fi
+
+  if [ -s "${NODE3_LAST_SILVER_MANIFEST}" ]; then
+    comm -13 "${NODE3_LAST_SILVER_MANIFEST}" "${NODE3_CURRENT_SILVER_MANIFEST}" \
+      | awk '{print $3}' > "${NODE3_CURRENT_SILVER_DELTA_MANIFEST}"
+  else
+    awk '{print $3}' "${NODE3_CURRENT_SILVER_MANIFEST}" > "${NODE3_CURRENT_SILVER_DELTA_MANIFEST}"
+  fi
+
+  local delta_count
+  delta_count="$(wc -l < "${NODE3_CURRENT_SILVER_DELTA_MANIFEST}" | tr -d ' ')"
+  echo "Silver delta manifest contains ${delta_count} objects."
+}
+
 stop_stale_h2o_processes() {
   local stale_h2o_pids
   stale_h2o_pids="$(pgrep -f '/h2o\\.jar' || true)"
@@ -359,6 +383,63 @@ stop_stale_h2o_processes() {
   if [ -n "${stale_h2o_pids}" ]; then
     echo "Force-stopping stubborn H2O JVMs: ${stale_h2o_pids}"
     sudo kill -9 ${stale_h2o_pids} 2>/dev/null || true
+  fi
+}
+
+bootstrap_local_gold_snapshot() {
+  mkdir -p "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}" "${LOCAL_GOLD_RETRAIN_CSV_PATH}"
+
+  if [ "${NODE3_RESET_LOCAL_GOLD_SNAPSHOT}" = "true" ]; then
+    echo "Resetting the local Gold snapshot because NODE3_RESET_LOCAL_GOLD_SNAPSHOT=true."
+    sudo rm -rf "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}" "${LOCAL_GOLD_RETRAIN_CSV_PATH}"
+    mkdir -p "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}" "${LOCAL_GOLD_RETRAIN_CSV_PATH}"
+  fi
+
+  if find "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}" -type f -name "*.parquet" -print -quit | grep -q .; then
+    echo "Local Gold Parquet snapshot already exists. Reusing it for cumulative retraining."
+    return 0
+  fi
+
+  echo "Bootstrapping the local Gold snapshot from GCS so retraining can use old + new data."
+  gcloud storage rsync -r "${GOLD_RETRAIN_PARQUET_PATH}" "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}" || true
+  gcloud storage rsync -r "${GOLD_RETRAIN_CSV_PATH}" "${LOCAL_GOLD_RETRAIN_CSV_PATH}" || true
+
+  if find "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}" -type f -name "*.parquet" -print -quit | grep -q .; then
+    echo "Local Gold snapshot bootstrapped from GCS."
+  else
+    echo "No existing Gold Parquet snapshot was found in GCS. The next Spark run will rebuild Gold from the full Silver snapshot."
+  fi
+}
+
+sync_silver_snapshot() {
+  local delta_count=0
+  if [ -s "${NODE3_CURRENT_SILVER_DELTA_MANIFEST}" ]; then
+    delta_count="$(wc -l < "${NODE3_CURRENT_SILVER_DELTA_MANIFEST}" | tr -d ' ')"
+  fi
+
+  if [ "${delta_count}" -gt 0 ] && [ "${delta_count}" -le "${NODE3_INCREMENTAL_SYNC_MAX_FILES}" ]; then
+    echo "Syncing ${delta_count} changed Silver objects into the local snapshot."
+    while IFS= read -r object_path; do
+      [ -n "${object_path}" ] || continue
+      local relative_path
+      local local_target
+      relative_path="${object_path#${SILVER_FEATURES_PATH%/}/}"
+      local_target="${LOCAL_SILVER_FEATURES_PATH%/}/${relative_path}"
+      mkdir -p "$(dirname "${local_target}")"
+      gcloud storage cp "${object_path}" "${local_target}" >/dev/null
+    done < "${NODE3_CURRENT_SILVER_DELTA_MANIFEST}"
+    return 0
+  fi
+
+  if [ "${delta_count}" -gt "${NODE3_INCREMENTAL_SYNC_MAX_FILES}" ]; then
+    echo "Silver delta is too large for per-file incremental sync (${delta_count} files > ${NODE3_INCREMENTAL_SYNC_MAX_FILES}). Falling back to full rsync."
+  else
+    echo "Silver delta manifest is unavailable. Falling back to full rsync."
+  fi
+
+  if ! gcloud storage rsync -r "${SILVER_FEATURES_PATH}" "${LOCAL_SILVER_FEATURES_PATH}"; then
+    echo "WARNING: Silver rsync reported transient copy errors while streaming was active."
+    echo "WARNING: Continuing with the files that were copied into the local snapshot."
   fi
 }
 
@@ -425,6 +506,8 @@ if silver_manifest_unchanged_since_last_success; then
   exit 0
 fi
 
+write_silver_delta_manifest || true
+
 echo "Syncing Silver data from GCS to local disk for Spark processing."
 echo "GCS Silver:   ${SILVER_FEATURES_PATH}"
 echo "Local Silver: ${LOCAL_SILVER_FEATURES_PATH}"
@@ -440,10 +523,7 @@ else
 fi
 
 mkdir -p "${LOCAL_SILVER_FEATURES_PATH}" "${LOCAL_GOLD_RETRAIN_PATH}"
-if ! gcloud storage rsync -r "${SILVER_FEATURES_PATH}" "${LOCAL_SILVER_FEATURES_PATH}"; then
-  echo "WARNING: Silver rsync reported transient copy errors while streaming was active."
-  echo "WARNING: Continuing with the files that were copied into the local snapshot."
-fi
+sync_silver_snapshot
 
 LOCAL_SILVER_SAMPLE_FILE="$(find "${LOCAL_SILVER_FEATURES_PATH}" -type f -print -quit)"
 if [ -z "${LOCAL_SILVER_SAMPLE_FILE}" ]; then
@@ -454,7 +534,7 @@ fi
 echo "Local Silver snapshot is ready. Sample file: ${LOCAL_SILVER_SAMPLE_FILE}"
 
 echo "Preparing local Spark output directories with container-writable permissions."
-sudo rm -rf "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}" "${LOCAL_GOLD_RETRAIN_CSV_PATH}"
+bootstrap_local_gold_snapshot
 mkdir -p "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}" "${LOCAL_GOLD_RETRAIN_CSV_PATH}"
 sudo chown -R "$(id -u):$(id -g)" "${LOCAL_CLOUD_DATA_DIR}"
 sudo chmod -R a+rwX "${LOCAL_CLOUD_DATA_DIR}"
@@ -474,9 +554,12 @@ compose_cmd \
   exec -T spark-master \
   env \
   SILVER_FEATURES_PATH=/data/cloud/silver/flink_features \
+  SILVER_DELTA_MANIFEST_PATH=/opt/traffic/logs/retrain_state/current-silver-delta-manifest.txt \
+  EXISTING_GOLD_PARQUET_PATH=/data/cloud/gold/features/retrain/parquet \
   GOLD_RETRAIN_PATH=/data/cloud/gold/features/retrain \
   GOLD_RETRAIN_PARQUET_PATH=/data/cloud/gold/features/retrain/parquet \
   GOLD_RETRAIN_CSV_PATH=/data/cloud/gold/features/retrain/csv \
+  SPARK_INCREMENTAL_MAX_FILES="${SPARK_INCREMENTAL_MAX_FILES:-10000}" \
   /opt/spark/bin/spark-submit \
   --master spark://spark-master:7077 \
   /opt/traffic/processing/spark_batch.py
