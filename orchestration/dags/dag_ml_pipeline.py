@@ -39,10 +39,21 @@ with DAG(
             set -euo pipefail
             echo "=== [Airflow DAG] Triggering Node3 retrain (Spark + H2O) ==="
             echo "Node3 target: ${NODE3_INTERNAL_IP:-10.128.0.8}"
-            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 $HUNG_SSH_USER@10.128.0.8 "cd /opt/traffic && RETRAIN_MIN_US_ROWS=0 NODE3_RESET_LOCAL_SILVER_SNAPSHOT=true NODE3_RESET_LOCAL_GOLD_SNAPSHOT=true H2O_MAX_RUNTIME=1200 NODE3_LOCK_BUSY_EXIT_CODE=0 bash scripts/gcp/run-node3.sh"
+            SSH_KEY_PATH="${SSH_KEY:-/run/secrets/google_compute_engine}"
+            if [ ! -f "$SSH_KEY_PATH" ]; then
+                echo "=== SSH key not found at $SSH_KEY_PATH, trying gcloud ==="
+                gcloud compute ssh node3-batch --project=big-data-group-4 --zone=us-central1-a --command="cd /opt/traffic && RETRAIN_MIN_US_ROWS=0 NODE3_RESET_LOCAL_SILVER_SNAPSHOT=true NODE3_RESET_LOCAL_GOLD_SNAPSHOT=true H2O_MAX_RUNTIME=1800 NODE3_LOCK_BUSY_EXIT_CODE=0 bash scripts/gcp/run-node3.sh" -- -o StrictHostKeyChecking=no -o ConnectTimeout=60
+            else
+                echo "Using SSH key: $SSH_KEY_PATH"
+                ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no -o ConnectTimeout=60 "${HUNG_SSH_USER:-hung}@${NODE3_INTERNAL_IP:-10.128.0.8}" "cd /opt/traffic && RETRAIN_MIN_US_ROWS=0 NODE3_RESET_LOCAL_SILVER_SNAPSHOT=true NODE3_RESET_LOCAL_GOLD_SNAPSHOT=true H2O_MAX_RUNTIME=1800 NODE3_LOCK_BUSY_EXIT_CODE=0 bash scripts/gcp/run-node3.sh"
+            fi
             echo "=== [Airflow DAG] Retrain completed at $(date -u) ==="
         """,
-        env={"HUNG_SSH_USER": "{{ var.value.get('hung_ssh_user', 'hung') }}"},
+        env={
+            "HUNG_SSH_USER": "{{ var.value.get('hung_ssh_user', 'hung') }}",
+            "SSH_KEY": "{{ var.value.get('ssh_key', '/run/secrets/google_compute_engine') }}",
+            "NODE3_INTERNAL_IP": "{{ var.value.get('node3_internal_ip', '10.128.0.8') }}",
+        },
         execution_timeout=timedelta(hours=3),
     )
 
