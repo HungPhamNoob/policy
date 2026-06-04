@@ -1,5 +1,7 @@
 """System and model status endpoints."""
 
+import os
+
 from fastapi import APIRouter
 
 from app.core.config import get_settings
@@ -12,12 +14,31 @@ router = APIRouter()
 def get_system_status() -> dict:
     """Return pipeline configuration and lightweight status metadata."""
     settings = get_settings()
+    tomtom_api_key = str(
+        os.getenv("TOMTOM_API_KEY") or os.getenv("TOMTOM_API") or ""
+    ).strip()
+    tomtom_poll_seconds = int(float(os.getenv("TOMTOM_POLL_SECONDS", "60") or "60"))
+    tomtom_flush_interval_seconds = int(
+        float(os.getenv("TOMTOM_FLUSH_INTERVAL_SECONDS", "15") or "15")
+    )
+    tomtom_live_status = "configured" if tomtom_api_key else "missing_credentials"
     return {
         "environment": settings.environment,
         "kafka": {
             "us_topic": settings.kafka_topic_raw,
             "tomtom_topic": settings.kafka_topic_tomtom_raw,
             "status": "configured",
+        },
+        "tomtom_live": {
+            "status": tomtom_live_status,
+            "credentials_configured": bool(tomtom_api_key),
+            "poll_seconds": tomtom_poll_seconds,
+            "flush_interval_seconds": tomtom_flush_interval_seconds,
+            "note": (
+                "TomTom producer can poll live incidents."
+                if tomtom_api_key
+                else "TomTom producer is idle until TOMTOM_API_KEY is configured."
+            ),
         },
         "flink": {
             "job_name": "Flink Traffic Risk Prediction",

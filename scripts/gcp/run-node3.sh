@@ -20,10 +20,14 @@ NODE3_RESET_LOCAL_SILVER_SNAPSHOT="${NODE3_RESET_LOCAL_SILVER_SNAPSHOT:-false}"
 NODE3_RUN_BATCH_PIPELINE="${NODE3_RUN_BATCH_PIPELINE:-true}"
 NODE3_LOG_DIR="${PROJECT_ROOT}/logs"
 NODE3_STATE_DIR="${NODE3_LOG_DIR}/retrain_state"
+NODE3_STATUS_FILE="${NODE3_STATE_DIR}/node3-retrain-status.json"
+NODE3_LAUNCH_METADATA_FILE="${NODE3_STATE_DIR}/node3-retrain-launch.json"
+NODE3_BACKGROUND_PID_FILE="${NODE3_STATE_DIR}/node3-retrain.pid"
 NODE3_LOCK_DIR="${NODE3_LOG_DIR}/.node3-run.lock"
 NODE3_LOCK_PID_FILE="${NODE3_LOCK_DIR}/pid"
 NODE3_LOCK_OWNED=0
 NODE3_LOCK_BUSY_EXIT_CODE="${NODE3_LOCK_BUSY_EXIT_CODE:-75}"
+NODE3_LOCK_BUSY=0
 APT_CACHE_UPDATED=0
 NODE3_TEMP_DIR="$(mktemp -d /tmp/node3-run-XXXXXX)"
 NODE3_SILVER_LS_STDOUT="${NODE3_TEMP_DIR}/silver-ls.txt"
@@ -42,6 +46,12 @@ NODE3_LOCAL_PENDING_TOTAL_COUNT=0
 NODE3_CURRENT_BATCH_ID=""
 NODE3_REMOTE_PENDING_MANIFEST_COUNT=0
 NODE3_INCREMENTAL_BATCH_LIMIT="${NODE3_DELTA_BATCH_MAX_FILES:-${SPARK_INCREMENTAL_MAX_FILES:-10000}}"
+NODE3_STATUS_VALUE="failed"
+NODE3_STATUS_MESSAGE="Node 3 retrain did not complete."
+NODE3_STATUS_PHASE="initializing"
+NODE3_STATUS_MODELS_LOGGED=0
+NODE3_STATUS_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+NODE3_STATUS_UPDATED_AT="${NODE3_STATUS_STARTED_AT}"
 
 ensure_path_writable() {
   local target_path="$1"
@@ -50,12 +60,71 @@ ensure_path_writable() {
   fi
 
   sudo mkdir -p "${target_path}"
-  sudo chown -R "$(id -u):$(id -g)" "${target_path}"
-  sudo chmod -R u+rwX,g+rwX "${target_path}"
+  sudo chown "$(id -u):$(id -g)" "${target_path}"
+  sudo chmod u+rwX,g+rwX "${target_path}"
+}
+
+ensure_path_container_writable() {
+  local target_path="$1"
+  if [ -z "${target_path}" ]; then
+    return 0
+  fi
+
+  ensure_path_writable "${target_path}"
+
+  # Spark containers run as uid/gid `spark` instead of the VM login user.
+  # The local Silver/Gold snapshot lives on a bind mount, so Docker tasks need
+  # world-writable execute bits on the host path to create `_temporary` outputs.
+  sudo chmod a+rwx "${target_path}"
 }
 
 cleanup_node3_temp() {
   rm -rf "${NODE3_TEMP_DIR}" 2>/dev/null || true
+}
+
+write_node3_status() {
+  local status="$1"
+  local phase="$2"
+  local message="$3"
+  local batch_id="${4:-${NODE3_CURRENT_BATCH_ID}}"
+  local models_logged="${5:-${NODE3_STATUS_MODELS_LOGGED}}"
+  local updated_at
+  updated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  NODE3_STATUS_VALUE="${status}"
+  NODE3_STATUS_PHASE="${phase}"
+  NODE3_STATUS_MESSAGE="${message}"
+  NODE3_STATUS_UPDATED_AT="${updated_at}"
+  NODE3_STATUS_MODELS_LOGGED="${models_logged}"
+
+  mkdir -p "${NODE3_STATE_DIR}"
+  python3 - "${NODE3_STATUS_FILE}" "${status}" "${phase}" "${message}" "${batch_id}" "${NODE3_STATUS_STARTED_AT}" "${updated_at}" "${models_logged}" "$$" <<'PY'
+import json
+import sys
+
+payload = {
+    "status": sys.argv[2],
+    "phase": sys.argv[3],
+    "message": sys.argv[4],
+    "batch_id": sys.argv[5] or None,
+    "started_at": sys.argv[6],
+    "updated_at": sys.argv[7],
+    "models_logged": int(sys.argv[8]),
+    "pid": int(sys.argv[9]),
+}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=True, indent=2)
+PY
+}
+
+cleanup_background_pid() {
+  if [ -f "${NODE3_BACKGROUND_PID_FILE}" ]; then
+    local recorded_pid
+    recorded_pid="$(tr -d ' \n\r' < "${NODE3_BACKGROUND_PID_FILE}" 2>/dev/null || true)"
+    if [ "${recorded_pid}" = "$$" ]; then
+      rm -f "${NODE3_BACKGROUND_PID_FILE}"
+    fi
+  fi
 }
 
 release_node3_lock() {
@@ -79,6 +148,7 @@ acquire_node3_lock() {
     existing_pid="$(cat "${NODE3_LOCK_PID_FILE}" 2>/dev/null || true)"
     if [ -n "${existing_pid}" ] && kill -0 "${existing_pid}" 2>/dev/null; then
       echo "Another Node 3 batch/retraining run is already active (PID ${existing_pid}). Exiting without interrupting it."
+      NODE3_LOCK_BUSY=1
       exit "${NODE3_LOCK_BUSY_EXIT_CODE}"
     fi
   fi
@@ -92,18 +162,59 @@ acquire_node3_lock() {
   fi
 
   echo "Another Node 3 batch/retraining run acquired the lock first. Exiting cleanly."
+  NODE3_LOCK_BUSY=1
   exit "${NODE3_LOCK_BUSY_EXIT_CODE}"
 }
 
-trap 'cleanup_node3_temp; release_node3_lock' EXIT
+handle_node3_exit() {
+  local exit_code=$?
+  if [ "${NODE3_LOCK_BUSY}" -eq 1 ] && [ "${exit_code}" -eq "${NODE3_LOCK_BUSY_EXIT_CODE}" ]; then
+    cleanup_background_pid
+    cleanup_node3_temp
+    release_node3_lock
+    exit "${exit_code}"
+  fi
+  if [ "${exit_code}" -eq 0 ]; then
+    if [ "${NODE3_STATUS_VALUE}" = "failed" ]; then
+      write_node3_status "continue" "${NODE3_STATUS_PHASE}" "${NODE3_STATUS_MESSAGE}" "${NODE3_CURRENT_BATCH_ID}" "${NODE3_STATUS_MODELS_LOGGED}"
+    fi
+  else
+    write_node3_status "failed" "${NODE3_STATUS_PHASE}" "${NODE3_STATUS_MESSAGE}" "${NODE3_CURRENT_BATCH_ID}" "${NODE3_STATUS_MODELS_LOGGED}"
+  fi
+  cleanup_background_pid
+  cleanup_node3_temp
+  release_node3_lock
+  exit "${exit_code}"
+}
+
+trap 'NODE3_STATUS_MESSAGE="Node 3 retrain failed at line ${LINENO}."; NODE3_STATUS_PHASE="failed"' ERR
+trap 'handle_node3_exit' EXIT
 
 echo "Node 3 run script started at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "Project root: ${PROJECT_ROOT}"
 echo "Environment file: ${ENV_FILE}"
 
+ensure_path_writable "${NODE3_LOG_DIR}"
+ensure_path_writable "${NODE3_STATE_DIR}"
+for state_file in \
+  "${NODE3_STATUS_FILE}" \
+  "${NODE3_LAUNCH_METADATA_FILE}" \
+  "${NODE3_BACKGROUND_PID_FILE}" \
+  "${NODE3_CURRENT_SILVER_DELTA_MANIFEST}" \
+  "${NODE3_CURRENT_SILVER_WATERMARK_FILE}" \
+  "${NODE3_LAST_SUCCESSFUL_SILVER_WATERMARK_FILE}" \
+  "${NODE3_CURRENT_SILVER_PENDING_TOTAL_FILE}"; do
+  if [ -e "${state_file}" ]; then
+    sudo chown "$(id -u):$(id -g)" "${state_file}" 2>/dev/null || true
+    sudo chmod u+rw,g+rw "${state_file}" 2>/dev/null || true
+  fi
+done
+
 acquire_node3_lock
 echo "Node 3 execution lock acquired by PID $$."
 echo "NODE3_RUN_BATCH_PIPELINE: ${NODE3_RUN_BATCH_PIPELINE}"
+write_node3_status "continue" "starting" "Node 3 retrain job started and acquired the execution lock."
+write_node3_status "continue" "bootstrap" "Node 3 lock acquired. Preparing Spark and retrain runtime."
 
 cd "${PROJECT_ROOT}"
 
@@ -638,11 +749,13 @@ echo "Waiting for Spark master to accept jobs..."
 sleep 20
 
 if [ "${NODE3_RUN_BATCH_PIPELINE}" != "true" ]; then
+  write_node3_status "continue" "services_only" "Spark services started without batch processing because NODE3_RUN_BATCH_PIPELINE is disabled."
   echo "NODE3_RUN_BATCH_PIPELINE=${NODE3_RUN_BATCH_PIPELINE}. Spark services were started without running Silver -> Gold or H2O retraining."
   exit 0
 fi
 
 if replay_row_count_below_retrain_gate; then
+  write_node3_status "continue" "waiting_for_replay" "Replay row count is below the retrain gate. Waiting for the next schedule tick."
   echo "Skipping Silver -> Gold and H2O retraining until enough US replay rows are available."
   compose_cmd \
     --project-directory "${NODE3_COMPOSE_DIR}" \
@@ -665,10 +778,13 @@ export NODE3_CURRENT_SILVER_WATERMARK_FILE
 export NODE3_LAST_SUCCESSFUL_SILVER_WATERMARK_FILE
 
 wait_for_silver_data
+write_node3_status "continue" "syncing_silver" "Silver data is visible. Syncing incremental Silver snapshot to local disk."
 
 ensure_path_writable "${LOCAL_CLOUD_DATA_DIR}"
 ensure_path_writable "${LOCAL_SILVER_FEATURES_PATH}"
 ensure_path_writable "${LOCAL_GOLD_RETRAIN_PATH}"
+ensure_path_container_writable "${LOCAL_CLOUD_DATA_DIR}"
+ensure_path_container_writable "${LOCAL_GOLD_RETRAIN_PATH}"
 
 echo "Syncing Silver data from GCS to local disk for Spark processing."
 echo "GCS Silver:   ${SILVER_FEATURES_PATH}"
@@ -707,6 +823,7 @@ fi
 build_local_silver_delta_manifest
 
 if [ "${NODE3_LOCAL_PENDING_DELTA_COUNT}" -eq 0 ]; then
+  write_node3_status "continue" "idle" "No new Silver data since the last successful retrain. Waiting for the next schedule tick."
   echo "No new Silver data since the last successful retrain. Skipping Spark and H2O for this schedule tick."
   compose_cmd \
     --project-directory "${NODE3_COMPOSE_DIR}" \
@@ -722,6 +839,7 @@ else
   NODE3_CURRENT_BATCH_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 fi
 echo "Current retrain batch ID: ${NODE3_CURRENT_BATCH_ID}"
+write_node3_status "continue" "batch_selected" "Selected a new retrain batch from Silver and will run Spark plus H2O." "${NODE3_CURRENT_BATCH_ID}"
 
 LOCAL_SILVER_SAMPLE_FILE="$(find "${LOCAL_SILVER_FEATURES_PATH}" -type f -print -quit)"
 if [ -z "${LOCAL_SILVER_SAMPLE_FILE}" ]; then
@@ -736,8 +854,22 @@ bootstrap_local_gold_snapshot
 ensure_path_writable "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}"
 ensure_path_writable "${LOCAL_GOLD_RETRAIN_CSV_PATH}"
 ensure_path_writable "${LOCAL_CLOUD_DATA_DIR}"
+ensure_path_container_writable "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}"
+ensure_path_container_writable "${LOCAL_GOLD_RETRAIN_CSV_PATH}"
+ensure_path_container_writable "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}/incremental_batches"
+ensure_path_container_writable "${LOCAL_GOLD_RETRAIN_CSV_PATH}/incremental_batches"
+
+CURRENT_BATCH_PARQUET_PATH="${LOCAL_GOLD_RETRAIN_PARQUET_PATH}/incremental_batches/${NODE3_CURRENT_BATCH_ID}"
+CURRENT_BATCH_CSV_PATH="${LOCAL_GOLD_RETRAIN_CSV_PATH}/incremental_batches/${NODE3_CURRENT_BATCH_ID}"
+if [ -d "${CURRENT_BATCH_PARQUET_PATH}" ] || [ -d "${CURRENT_BATCH_CSV_PATH}" ]; then
+  echo "Removing stale local output for retrain batch ${NODE3_CURRENT_BATCH_ID} before Spark retries it."
+  sudo rm -rf "${CURRENT_BATCH_PARQUET_PATH}" "${CURRENT_BATCH_CSV_PATH}"
+fi
+ensure_path_container_writable "${CURRENT_BATCH_PARQUET_PATH}"
+ensure_path_container_writable "${CURRENT_BATCH_CSV_PATH}"
 
 echo "Running Spark silver-to-gold job once. Existing checkpoints/data are preserved."
+write_node3_status "continue" "spark" "Running Spark Silver-to-Gold job for the current retrain batch." "${NODE3_CURRENT_BATCH_ID}"
 compose_cmd \
   --project-directory "${NODE3_COMPOSE_DIR}" \
   --env-file "${ENV_FILE}" \
@@ -770,6 +902,7 @@ gcloud storage rsync -r "${LOCAL_GOLD_RETRAIN_CSV_PATH}" "${GOLD_RETRAIN_CSV_PAT
 stop_spark_services_for_h2o
 
 echo "Running online H2O retraining once from the latest gold data."
+write_node3_status "continue" "h2o" "Spark completed. Running H2O AutoML retraining and MLflow logging." "${NODE3_CURRENT_BATCH_ID}"
 SKIP_H2O_RETRAIN=0
 if ! find "${LOCAL_GOLD_RETRAIN_CSV_PATH}" -type f -name "*.csv" -size +0 -print -quit | grep -q .; then
   echo "No Gold CSV files found at ${LOCAL_GOLD_RETRAIN_CSV_PATH}. Skipping H2O retraining."
@@ -798,6 +931,7 @@ if [ "${SKIP_H2O_RETRAIN}" -eq 0 ] && [ "${RETRAIN_MIN_US_ROWS}" -gt 0 ]; then
 fi
 
 if [ "${SKIP_H2O_RETRAIN}" -eq 1 ]; then
+  write_node3_status "continue" "skip_h2o" "Gold data is unavailable or below the gate, so H2O retraining was skipped for this tick." "${NODE3_CURRENT_BATCH_ID}"
   echo "Skipping H2O retraining for this run."
   compose_cmd \
     --project-directory "${NODE3_COMPOSE_DIR}" \
@@ -809,7 +943,12 @@ fi
 
 stop_stale_h2o_processes
 
-RETRAINING_VENV="${PROJECT_ROOT}/.venv-node3"
+# Prefer the runner user's venv even if this script is launched via sudo/root (common via Airflow SSH).
+# Falling back to $HOME would create a separate /root venv and re-download large wheels every tick.
+RETRAINING_VENV="${NODE3_VENV_PATH:-/home/runner/.venv-traffic-node3}"
+if [ ! -d "${RETRAINING_VENV}" ] && [ -n "${HOME:-}" ]; then
+  RETRAINING_VENV="${HOME}/.venv-traffic-node3"
+fi
 RETRAINING_PYTHON="${RETRAINING_VENV}/bin/python"
 if [ ! -x "${RETRAINING_PYTHON}" ]; then
   python3 -m venv "${RETRAINING_VENV}"
@@ -855,13 +994,31 @@ else
   echo "Python retraining dependencies already exist in ${RETRAINING_VENV}."
 fi
 
-H2O_MAX_RUNTIME="${NODE3_H2O_MAX_RUNTIME:-${H2O_MAX_RUNTIME:-3600}}" \
+# Keep online retraining bounded so scheduled ticks (20 minutes) make progress without exhausting the VM.
+# Use a node3-specific heap default instead of the shared H2O_MAX_MEM value because the
+# cumulative online retrain dataset is materially larger than the offline/local defaults.
+H2O_MAX_RUNTIME="${NODE3_H2O_MAX_RUNTIME:-900}" \
+  H2O_MAX_MEM="${NODE3_H2O_MAX_MEM:-4G}" \
   H2O_NTHREADS="${NODE3_H2O_NTHREADS:-${H2O_NTHREADS:-2}}" \
+  H2O_BALANCE_CLASSES="${NODE3_H2O_BALANCE_CLASSES:-${H2O_BALANCE_CLASSES:-false}}" \
+  H2O_TRAIN_MAX_ROWS="${NODE3_H2O_TRAIN_MAX_ROWS:-${H2O_TRAIN_MAX_ROWS:-300000}}" \
+  H2O_EVAL_MAX_ROWS="${NODE3_H2O_EVAL_MAX_ROWS:-${H2O_EVAL_MAX_ROWS:-25000}}" \
+  H2O_MAX_AFTER_BALANCE_SIZE="${NODE3_H2O_MAX_AFTER_BALANCE_SIZE:-${H2O_MAX_AFTER_BALANCE_SIZE:-1.0}}" \
+  H2O_MAX_RUNTIME_SECS_PER_MODEL="${NODE3_H2O_MAX_RUNTIME_SECS_PER_MODEL:-${H2O_MAX_RUNTIME_SECS_PER_MODEL:-60}}" \
+  H2O_FALLBACK_PER_MODEL_RUNTIME_SECS="${NODE3_H2O_FALLBACK_PER_MODEL_RUNTIME_SECS:-${H2O_FALLBACK_PER_MODEL_RUNTIME_SECS:-25}}" \
+  H2O_NFOLDS="${NODE3_H2O_NFOLDS:-${H2O_NFOLDS:-0}}" \
+  H2O_EXCLUDE_ALGOS="${NODE3_H2O_EXCLUDE_ALGOS:-${H2O_EXCLUDE_ALGOS:-DeepLearning,StackedEnsemble,XGBoost}}" \
+  H2O_TOP_K_MODELS="${NODE3_H2O_TOP_K_MODELS:-${H2O_TOP_K_MODELS:-10}}" \
+  H2O_MAX_MODELS="${NODE3_H2O_MAX_MODELS:-${H2O_MAX_MODELS:-4}}" \
+  NODE3_STATUS_FILE="${NODE3_STATUS_FILE}" \
   RETRAIN_BATCH_ID="${NODE3_CURRENT_BATCH_ID}" \
   RETRAIN_DATA_PATH="${LOCAL_GOLD_RETRAIN_CSV_PATH}" \
   "${RETRAINING_PYTHON}" ml/training/h2o_after_2020.py
 
+NODE3_STATUS_MODELS_LOGGED="${NODE3_H2O_TOP_K_MODELS:-${H2O_TOP_K_MODELS:-10}}"
+
 mark_silver_watermark_processed
+write_node3_status "continue" "completed" "Spark and H2O retraining completed successfully. Waiting for the next schedule tick." "${NODE3_CURRENT_BATCH_ID}" "${NODE3_STATUS_MODELS_LOGGED}"
 
 echo "Node 3 services:"
 compose_cmd \

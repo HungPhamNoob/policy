@@ -243,6 +243,18 @@ gcloud compute ssh node2-streaming --zone=us-central1-a --project=big-data-group
 '
 ```
 
+For a safer runtime-config rollout on node2, prefer the controlled restart helper.
+It cancels the current Flink job through the REST API, waits for zero running jobs,
+then recreates only the submitter container and waits for exactly one replacement
+job to return:
+
+```bash
+gcloud compute ssh node2-streaming --zone=us-central1-a --project=big-data-group-4 --command='
+  cd /opt/traffic &&
+  bash scripts/gcp/restart-node2-flink-job.sh
+'
+```
+
 ## 6. GitHub Actions Deploy
 
 Workflow: `.github/workflows/ci-cd.yaml`.

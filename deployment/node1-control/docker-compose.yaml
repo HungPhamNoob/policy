@@ -9,7 +9,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - ${NODE1_POSTGRES_VOLUME:-traffic_postgres_data}:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-capstone} -d ${POSTGRES_DB:-capstone_db}"]
       interval: 10s
@@ -73,7 +73,7 @@ services:
       - PROJECT_ROOT=/opt/traffic
       - MLFLOW_TRACKING_URI=http://mlflow:5000
       - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
-      - AIRFLOW_MODEL_RETRAIN_SCHEDULE=${AIRFLOW_MODEL_RETRAIN_SCHEDULE:-*/20 * * * *}
+      - AIRFLOW_MODEL_RETRAIN_SCHEDULE=${AIRFLOW_MODEL_RETRAIN_SCHEDULE:-*/45 * * * *}
       - AIRFLOW_STREAM_HEALTH_SCHEDULE=${AIRFLOW_STREAM_HEALTH_SCHEDULE:-*/2 * * * *}
       - SSH_KEY=/run/secrets/google_compute_engine
       - HUNG_SSH_USER=${HUNG_SSH_USER:-runner}
@@ -132,7 +132,7 @@ services:
       - PROJECT_ROOT=/opt/traffic
       - MLFLOW_TRACKING_URI=http://mlflow:5000
       - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
-      - AIRFLOW_MODEL_RETRAIN_SCHEDULE=${AIRFLOW_MODEL_RETRAIN_SCHEDULE:-*/20 * * * *}
+      - AIRFLOW_MODEL_RETRAIN_SCHEDULE=${AIRFLOW_MODEL_RETRAIN_SCHEDULE:-*/45 * * * *}
       - AIRFLOW_STREAM_HEALTH_SCHEDULE=${AIRFLOW_STREAM_HEALTH_SCHEDULE:-*/2 * * * *}
       - SSH_KEY=/run/secrets/google_compute_engine
       - HUNG_SSH_USER=${HUNG_SSH_USER:-runner}
@@ -247,7 +247,7 @@ services:
     environment:
       - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
     volumes:
-      - mlflow_data:/mlruns
+      - traffic_mlflow_data:/mlruns
       - ${GCP_SERVICE_ACCOUNT_KEY:-/dev/null}:/secrets/gcp-key.json:ro
     command: >
       bash -lc "exec mlflow server --host 0.0.0.0 --port 5000 -w ${MLFLOW_GUNICORN_WORKERS:-2} --backend-store-uri sqlite:////mlruns/mlflow.db --default-artifact-root ${MLFLOW_ARTIFACT_ROOT:-gs://capstone-data-lake/mlflow-artifacts}/ --gunicorn-opts \"--timeout ${MLFLOW_GUNICORN_TIMEOUT_SECONDS:-300}\""
@@ -274,7 +274,7 @@ services:
       - MLFLOW_TRACKING_URI=http://mlflow:5000
       - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
     volumes:
-      - mlflow_data:/mlruns
+      - traffic_mlflow_data:/mlruns
       - ${GCP_SERVICE_ACCOUNT_KEY:-/dev/null}:/secrets/gcp-key.json:ro
       - ../../scripts/gcp/mlflow-serving-entrypoint.sh:/app/mlflow-serving-entrypoint.sh:ro
     command: >
@@ -385,9 +385,11 @@ networks:
     external: true
 
 volumes:
-  postgres_data:
+  traffic_postgres_data:
+    external: true
   airflow_pg_data:
   prometheus_data:
   grafana_data:
   dashboard_next_cache:
-  mlflow_data:
+  traffic_mlflow_data:
+    external: true

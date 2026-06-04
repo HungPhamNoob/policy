@@ -21,13 +21,55 @@ TRACKED_METRICS = [
 ]
 
 
+def _coerce_int(value: Any) -> int | None:
+    value = _clean_value(value)
+    if value is None:
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _expected_model_count(row: Any) -> int | None:
+    return _coerce_int(
+        row.get("params.top_k_models")
+        or row.get("params.expected_top_models")
+        or row.get("params.H2O_TOP_K_MODELS")
+    )
+
+
+def _logged_model_count(row: Any) -> int | None:
+    return _coerce_int(
+        row.get("metrics.models_logged") or row.get("params.models_logged")
+    )
+
+
+def _is_complete_retrain_batch(row: Any) -> bool | None:
+    run_role = str(_clean_value(row.get("tags.run_role")) or "")
+    if run_role != "retrain_parent":
+        return None
+
+    status = str(_clean_value(row.get("status")) or "").upper()
+    expected = _expected_model_count(row)
+    logged = _logged_model_count(row)
+    if status != "FINISHED" or expected is None or logged is None:
+        return False
+    return logged >= expected
+
+
 def _is_retrain_run(row: Any) -> bool:
     run_name = str(_clean_value(row.get("tags.mlflow.runName")) or "")
     run_type_tag = str(_clean_value(row.get("tags.run_type")) or "")
     run_type_param = str(_clean_value(row.get("params.run_type")) or "")
+    run_role = str(_clean_value(row.get("tags.run_role")) or "")
+    parent_id = _clean_value(row.get("tags.mlflow.parentRunId"))
+    if run_role == "retrain_parent":
+        return True
+    if parent_id:
+        return False
     return (
         run_name == "h2o_retrain_online"
-        or run_name.startswith("retrain_top")
         or run_type_tag == "retrain_online"
         or run_type_param == "retrain_online"
     )
@@ -77,6 +119,37 @@ def _backfill_seed_runs(output: list[dict[str, Any]], limit: int) -> list[dict[s
     return output
 
 
+def _leaderboard_child_payload(row: Any) -> dict[str, Any]:
+    metrics = {
+        metric: _clean_value(row.get(f"metrics.{metric}"))
+        for metric in TRACKED_METRICS
+        if _clean_value(row.get(f"metrics.{metric}")) is not None
+    }
+    return {
+        "run_id": _clean_value(row.get("run_id")),
+        "run_name": _clean_value(row.get("tags.mlflow.runName")),
+        "status": _clean_value(row.get("status")),
+        "rank": _coerce_int(row.get("params.rank") or row.get("tags.rank")),
+        "model_id": _clean_value(row.get("params.model_id"))
+        or _clean_value(row.get("tags.model_id")),
+        "algo": _clean_value(row.get("params.algo"))
+        or _clean_value(row.get("tags.algo")),
+        "leaderboard_source": _clean_value(row.get("params.leaderboard_source"))
+        or _clean_value(row.get("tags.leaderboard_source")),
+        "start_time": (
+            row.get("start_time").isoformat()
+            if row.get("start_time") is not None
+            else None
+        ),
+        "end_time": (
+            row.get("end_time").isoformat()
+            if row.get("end_time") is not None
+            else None
+        ),
+        "metrics": metrics,
+    }
+
+
 def retrain_history(limit: int = 30) -> dict[str, Any]:
     """Return recent MLflow training runs with core classification metrics."""
     settings = get_settings()
@@ -90,11 +163,20 @@ def retrain_history(limit: int = 30) -> dict[str, Any]:
 
         runs = mlflow.search_runs(
             experiment_ids=[experiment.experiment_id],
-            max_results=max(limit * 4, 100),
+            max_results=max(limit * 12, 200),
             order_by=["start_time DESC"],
         )
-        output = []
+        parent_runs: list[dict[str, Any]] = []
+        leaderboard_children: dict[str, list[dict[str, Any]]] = {}
+        run_count = 0
         for _, row in runs.iterrows():
+            run_count += 1
+            parent_run_id = _clean_value(row.get("tags.mlflow.parentRunId"))
+            run_role = str(_clean_value(row.get("tags.run_role")) or "")
+            if parent_run_id and run_role == "leaderboard_model":
+                child_payload = _leaderboard_child_payload(row)
+                leaderboard_children.setdefault(str(parent_run_id), []).append(child_payload)
+                continue
             if not _is_retrain_run(row):
                 continue
             metrics = {
@@ -102,7 +184,7 @@ def retrain_history(limit: int = 30) -> dict[str, Any]:
                 for metric in TRACKED_METRICS
                 if _clean_value(row.get(f"metrics.{metric}")) is not None
             }
-            output.append(
+            parent_runs.append(
                 {
                     "run_id": _clean_value(row.get("run_id")),
                     "run_name": _clean_value(row.get("tags.mlflow.runName")),
@@ -112,6 +194,9 @@ def retrain_history(limit: int = 30) -> dict[str, Any]:
                     "run_role": _clean_value(row.get("tags.run_role")),
                     "retrain_batch_id": _clean_value(row.get("tags.retrain_batch_id"))
                     or _clean_value(row.get("params.retrain_batch_id")),
+                    "expected_models": _expected_model_count(row),
+                    "models_logged": _logged_model_count(row),
+                    "is_complete_batch": _is_complete_retrain_batch(row),
                     "start_time": (
                         row.get("start_time").isoformat()
                         if row.get("start_time") is not None
@@ -125,16 +210,30 @@ def retrain_history(limit: int = 30) -> dict[str, Any]:
                     "metrics": metrics,
                 }
             )
-            if len(output) >= limit:
+            if len(parent_runs) >= limit:
                 break
-        output = _backfill_seed_runs(output, limit)
+
+        for run in parent_runs:
+            child_runs = leaderboard_children.get(str(run.get("run_id")), [])
+            child_runs.sort(
+                key=lambda child: (
+                    child.get("rank") is None,
+                    child.get("rank") or 0,
+                    str(child.get("run_name") or ""),
+                )
+            )
+            run["leaderboard_models"] = child_runs
+
+        output = _backfill_seed_runs(parent_runs, limit)
+        for run in output:
+            run.setdefault("leaderboard_models", [])
         return {
             "status": "ok" if output else "not_enough_data",
             "experiment": settings.mlflow_experiment_name,
             "runs": output,
             "metrics": TRACKED_METRICS,
             "source": "mlflow_with_seed_backfill"
-            if len(output) > len(runs)
+            if len(output) > len(parent_runs)
             else "mlflow",
         }
     except Exception as exc:

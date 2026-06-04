@@ -288,6 +288,15 @@ def _fetch_latest_model_metrics() -> dict[str, Any]:
         if not runs:
             return {}
 
+        def is_complete_parent(run: dict[str, Any]) -> bool:
+            if run.get("run_name") != "h2o_retrain_online":
+                return False
+            expected_models = run.get("expected_models")
+            models_logged = run.get("models_logged")
+            if expected_models is None or models_logged is None:
+                return False
+            return int(models_logged) >= int(expected_models)
+
         # Prefer the parent online retrain run because it represents the
         # registered best model and carries the best child's metrics.
         best_run = next(
@@ -296,7 +305,7 @@ def _fetch_latest_model_metrics() -> dict[str, Any]:
                 for run in runs
                 if run.get("status") == "FINISHED"
                 and run.get("metrics", {}).get("weighted_f1") is not None
-                and run.get("run_name") == "h2o_retrain_online"
+                and is_complete_parent(run)
             ),
             None,
         )

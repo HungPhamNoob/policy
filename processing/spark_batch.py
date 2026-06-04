@@ -241,6 +241,17 @@ def build_incremental_output_paths():
     return parquet_output_path, csv_output_path
 
 
+def _delete_output_path(spark: SparkSession, path: str) -> None:
+    """Remove a stale batch output path so incremental retries stay idempotent."""
+    jvm = spark._jvm
+    hadoop_conf = spark.sparkContext._jsc.hadoopConfiguration()
+    target = jvm.org.apache.hadoop.fs.Path(path)
+    fs = target.getFileSystem(hadoop_conf)
+    if fs.exists(target):
+        logger.info("Deleting stale Spark output path before rewrite: %s", path)
+        fs.delete(target, True)
+
+
 def main() -> None:
     logger.info("=" * 80)
     logger.info("Spark Silver -> Gold Parquet Job")
@@ -259,6 +270,8 @@ def main() -> None:
         .config("spark.sql.adaptive.enabled", "true")
         .config("spark.sql.files.ignoreCorruptFiles", "true")
         .config("spark.sql.files.ignoreMissingFiles", "true")
+        .config("spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version", "2")
+        .config("spark.hadoop.mapreduce.fileoutputcommitter.cleanup-failures.ignored", "true")
         .config("spark.sql.session.timeZone", "UTC")
         .getOrCreate()
     )
@@ -311,6 +324,8 @@ def main() -> None:
                 parquet_output_path,
                 csv_output_path,
             )
+            _delete_output_path(spark, parquet_output_path)
+            _delete_output_path(spark, csv_output_path)
             partitioned_df.write.mode("overwrite").partitionBy("event_year").parquet(
                 parquet_output_path
             )

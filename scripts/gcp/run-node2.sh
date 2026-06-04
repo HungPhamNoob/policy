@@ -32,9 +32,12 @@ if [ -x "${PROJECT_ROOT}/scripts/gcp/sync-env-from-gcs.sh" ]; then
 fi
 
 if [ -f "${ENV_FILE}" ]; then
-  set -a
-  . "${ENV_FILE}"
-  set +a
+  while IFS= read -r line; do
+    case "${line}" in
+      ''|\#*) continue ;;
+      *=*) export "${line}" ;;
+    esac
+  done < "${ENV_FILE}"
 else
   echo "ERROR: ${ENV_FILE} does not exist."
   exit 1

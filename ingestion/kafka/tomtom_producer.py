@@ -83,6 +83,9 @@ TOMTOM_TIME_VALIDITY = get_str_env("TOMTOM_TIME_VALIDITY", "present")
 TOMTOM_FIELDS = get_str_env("TOMTOM_FIELDS", DEFAULT_FIELDS)
 TOMTOM_REQUEST_TIMEOUT_SECONDS = get_float_env("TOMTOM_REQUEST_TIMEOUT_SECONDS", 20.0)
 TOMTOM_POLL_SECONDS = get_float_env("TOMTOM_POLL_SECONDS", 60.0)
+TOMTOM_MISSING_KEY_RETRY_SECONDS = get_float_env(
+    "TOMTOM_MISSING_KEY_RETRY_SECONDS", 300.0
+)
 TOMTOM_RUN_ONCE = get_str_env("TOMTOM_RUN_ONCE", "false").lower() in {
     "1",
     "true",
@@ -341,7 +344,19 @@ def publish_event_if_changed(
 
 
 def main() -> None:
-    validate_config()
+    try:
+        validate_config()
+    except ValueError as exc:
+        if "TOMTOM_API" not in str(exc):
+            raise
+        logger.error("%s", exc)
+        logger.warning(
+            "TomTom producer will stay idle instead of crash-looping. "
+            "Inject TOMTOM_API_KEY and recreate the container to resume polling."
+        )
+        while True:
+            time.sleep(max(TOMTOM_MISSING_KEY_RETRY_SECONDS, 30.0))
+
     regions = parse_bbox_regions()
     producer = Producer(build_producer_config())
     last_seen_signatures: Dict[str, str] = {}

@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     environment: str = Field(default="local", alias="ENV")
 
     postgres_user: str = Field(default="capstone", alias="POSTGRES_USER")
-    postgres_password: str = Field(default="123", alias="POSTGRES_PASSWORD")
+    postgres_password: str = Field(default="changeme123", alias="POSTGRES_PASSWORD")
     postgres_db: str = Field(default="capstone_db", alias="POSTGRES_DB")
     postgres_host: str = Field(default="localhost", alias="POSTGRES_HOST")
     postgres_port: int = Field(default=5432, alias="POSTGRES_PORT")
@@ -54,7 +54,7 @@ class Settings(BaseSettings):
         alias="GOLD_RETRAIN_PATH",
     )
     airflow_model_retrain_schedule: str = Field(
-        default="0 * * * *",
+        default="*/45 * * * *",
         alias="AIRFLOW_MODEL_RETRAIN_SCHEDULE",
     )
     airflow_stream_health_schedule: str = Field(

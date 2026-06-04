@@ -3,8 +3,9 @@
 orchestration/dags/dag_ml_pipeline.py
 Airflow DAG: model_retrain_hourly
 
-Triggers the US accident severity model retraining pipeline every 20 minutes.
-Uses internal SSH to start run-node3.sh on node3-batch (10.128.0.8).
+Triggers the US accident severity model retraining pipeline every 45 minutes.
+Uses internal SSH to launch run-node3.sh on node3-batch (10.128.0.8) in the
+background, then reads Node 3's status file.
 """
 
 import os
@@ -25,22 +26,33 @@ default_args = {
 with DAG(
     dag_id="model_retrain_hourly",
     default_args=default_args,
-    description="H2O AutoML retraining every 20 min via internal SSH",
-    schedule_interval=os.getenv("AIRFLOW_MODEL_RETRAIN_SCHEDULE", "*/20 * * * *"),
+    description="H2O AutoML retraining every 45 min via internal SSH",
+    schedule_interval=os.getenv("AIRFLOW_MODEL_RETRAIN_SCHEDULE", "*/45 * * * *"),
     start_date=datetime(2026, 5, 1),
     catchup=False,
     max_active_runs=1,
     tags=["ml", "retrain", "batch", "spark", "h2o"],
 ) as dag:
 
-    spark_and_h2o = BashOperator(
-        task_id="spark_and_h2o_retrain_on_node3",
+    trigger_retrain = BashOperator(
+        task_id="trigger_node3_retrain_on_node3",
         bash_command="""
             set -euo pipefail
-            echo "=== [Airflow DAG] Triggering Node3 retrain (Spark + H2O) ==="
+            echo "=== [Airflow DAG] Launching Node3 retrain worker in background ==="
             SSH_KEY_PATH="${SSH_KEY:-/run/secrets/google_compute_engine}"
             SSH_USER="${HUNG_SSH_USER:-runner}"
             NODE3_IP="${NODE3_INTERNAL_IP:-10.128.0.8}"
+            if [ -d "${SSH_KEY_PATH}" ]; then
+                for candidate in \
+                    "${SSH_KEY_PATH}/traffic-inter-node.key" \
+                    "${SSH_KEY_PATH}/google_compute_engine" \
+                    "$(find "${SSH_KEY_PATH}" -maxdepth 2 -type f | head -n 1)"; do
+                    if [ -n "${candidate}" ] && [ -f "${candidate}" ]; then
+                        SSH_KEY_PATH="${candidate}"
+                        break
+                    fi
+                done
+            fi
             echo "Node3 target: ${SSH_USER}@${NODE3_IP}"
             echo "SSH key path: ${SSH_KEY_PATH}"
 
@@ -54,16 +66,70 @@ with DAG(
                 -o StrictHostKeyChecking=no \
                 -o ConnectTimeout=60 \
                 "${SSH_USER}@${NODE3_IP}" \
-                "cd /opt/traffic && RETRAIN_MIN_US_ROWS=0 H2O_MAX_RUNTIME=3600 NODE3_LOCK_BUSY_EXIT_CODE=0 bash scripts/gcp/run-node3.sh"
+                "cd /opt/traffic && bash scripts/gcp/launch-node3-retrain.sh"
 
-            echo "=== [Airflow DAG] Retrain completed at $(date -u) ==="
+            echo "=== [Airflow DAG] Node3 retrain worker launched at $(date -u) ==="
         """,
         env={
             "HUNG_SSH_USER": "runner",
             "SSH_KEY": "/run/secrets/google_compute_engine",
             "NODE3_INTERNAL_IP": "10.128.0.8",
         },
-        execution_timeout=timedelta(hours=4),
+        execution_timeout=timedelta(minutes=5),
+    )
+
+    check_retrain_status = BashOperator(
+        task_id="check_node3_retrain_status",
+        bash_command="""
+            set -euo pipefail
+            echo "=== [Airflow DAG] Reading Node3 retrain status ==="
+            SSH_KEY_PATH="${SSH_KEY:-/run/secrets/google_compute_engine}"
+            SSH_USER="${HUNG_SSH_USER:-runner}"
+            NODE3_IP="${NODE3_INTERNAL_IP:-10.128.0.8}"
+            if [ -d "${SSH_KEY_PATH}" ]; then
+                for candidate in \
+                    "${SSH_KEY_PATH}/traffic-inter-node.key" \
+                    "${SSH_KEY_PATH}/google_compute_engine" \
+                    "$(find "${SSH_KEY_PATH}" -maxdepth 2 -type f | head -n 1)"; do
+                    if [ -n "${candidate}" ] && [ -f "${candidate}" ]; then
+                        SSH_KEY_PATH="${candidate}"
+                        break
+                    fi
+                done
+            fi
+
+            STATUS_PAYLOAD="$(ssh -i "${SSH_KEY_PATH}" \
+                -o StrictHostKeyChecking=no \
+                -o ConnectTimeout=60 \
+                "${SSH_USER}@${NODE3_IP}" \
+                "python3 - <<'PY'\nimport json\nfrom pathlib import Path\nstatus_path = Path('/opt/traffic/logs/retrain_state/node3-retrain-status.json')\npid_path = Path('/opt/traffic/logs/retrain_state/node3-retrain.pid')\npayload = {'status': 'continue', 'phase': 'unknown', 'message': 'No Node3 retrain status file exists yet.'}\nif status_path.exists():\n    payload = json.loads(status_path.read_text(encoding='utf-8'))\npid = None\nif pid_path.exists():\n    try:\n        pid = int(pid_path.read_text(encoding='utf-8').strip())\n    except ValueError:\n        pid = None\npayload['running'] = False\npayload['pid'] = pid\nif pid is not None:\n    try:\n        import os\n        os.kill(pid, 0)\n        payload['running'] = True\n    except OSError:\n        payload['running'] = False\nprint(json.dumps(payload, ensure_ascii=True))\nPY")"
+
+            echo "${STATUS_PAYLOAD}"
+            export STATUS_PAYLOAD
+            python3 - <<'PY'
+import json
+import os
+import sys
+
+payload = json.loads(os.environ["STATUS_PAYLOAD"])
+status = str(payload.get("status", "continue")).lower()
+running = bool(payload.get("running"))
+
+if status == "failed":
+    raise SystemExit("Node3 retrain status is FAILED. Inspect node3-retrain-runner.log on node3.")
+
+if running:
+    print("Node3 retrain worker is still running in background. Airflow will allow it to continue.")
+else:
+    print(f"Node3 retrain worker is idle with status={status}.")
+PY
+        """,
+        env={
+            "HUNG_SSH_USER": "runner",
+            "SSH_KEY": "/run/secrets/google_compute_engine",
+            "NODE3_INTERNAL_IP": "10.128.0.8",
+        },
+        execution_timeout=timedelta(minutes=5),
     )
 
     notify = BashOperator(
@@ -71,4 +137,4 @@ with DAG(
         bash_command="echo 'Retrain pipeline finished at $(date -u)'",
     )
 
-    spark_and_h2o >> notify
+    trigger_retrain >> check_retrain_status >> notify

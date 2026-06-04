@@ -42,6 +42,41 @@ def _is_root_retrain_run(row: Any) -> bool:
     )
 
 
+def _coerce_metric_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _expected_models_for_root_run(row: Any) -> int | None:
+    return _coerce_metric_int(
+        row.get("params.top_k_models")
+        or row.get("params.expected_top_models")
+        or row.get("params.H2O_TOP_K_MODELS")
+    )
+
+
+def _logged_models_for_root_run(row: Any) -> int | None:
+    return _coerce_metric_int(
+        row.get("metrics.models_logged") or row.get("params.models_logged")
+    )
+
+
+def _root_run_is_complete(row: Any) -> bool:
+    if str(row.get("tags.run_role") or "") != "retrain_parent":
+        return False
+    if str(row.get("status") or "").upper() != "FINISHED":
+        return False
+    expected_models = _expected_models_for_root_run(row)
+    logged_models = _logged_models_for_root_run(row)
+    if expected_models is None or logged_models is None:
+        return False
+    return logged_models >= expected_models
+
+
 def _prediction_table_name() -> str:
     return get_settings().prediction_table.split(".")[-1]
 
@@ -326,6 +361,7 @@ def latency(metric: str, window: str = "5m") -> dict[str, Any]:
             latest_times.append(latest_timestamp)
         source_columns[table_name] = {
             "latency_columns": latency_columns,
+            "selected_latency_column": column,
             "time_column": time_column,
             "latest_timestamp": (
                 latest_timestamp.isoformat() if latest_timestamp else None
@@ -374,6 +410,47 @@ def latency(metric: str, window: str = "5m") -> dict[str, Any]:
             "window_anchor": window_anchor.replace(tzinfo=None),
         },
     ) or {}
+    source_latency: dict[str, Any] = {}
+    for table_name, metadata in source_columns.items():
+        source_query = sql.SQL(
+            """
+            SELECT
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms)::DOUBLE PRECISION AS p50,
+                percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)::DOUBLE PRECISION AS p95,
+                percentile_cont(0.99) WITHIN GROUP (ORDER BY latency_ms)::DOUBLE PRECISION AS p99,
+                AVG(latency_ms)::DOUBLE PRECISION AS avg,
+                COUNT(latency_ms)::BIGINT AS sample_count
+            FROM (
+                SELECT {latency_column} AS latency_ms
+                FROM {table}
+                WHERE {latency_column} IS NOT NULL
+                  AND {latency_column} >= 0
+                  AND {latency_column} <= %(latency_sanity_max_ms)s
+                  AND {time_column} >= (%(window_anchor)s - (%(window_seconds)s * INTERVAL '1 second'))
+                  AND {time_column} <= %(window_anchor)s
+            ) AS source_latency_samples
+            """
+        ).format(
+            table=table_identifier(table_name),
+            latency_column=sql.Identifier(str(metadata["selected_latency_column"])),
+            time_column=sql.Identifier(str(metadata["time_column"])),
+        )
+        source_row = fetch_one(
+            source_query,
+            {
+                "latency_sanity_max_ms": LATENCY_SANITY_MAX_MS,
+                "window_seconds": window_seconds,
+                "window_anchor": window_anchor.replace(tzinfo=None),
+            },
+        ) or {}
+        source_latency[table_name] = {
+            "latency_column": metadata["selected_latency_column"],
+            "p50": source_row.get("p50"),
+            "p95": source_row.get("p95"),
+            "p99": source_row.get("p99"),
+            "avg": source_row.get("avg"),
+            "sample_count": source_row.get("sample_count") or 0,
+        }
     allowed = {"p50", "p95", "p99", "avg"}
     metric_key = metric if metric in allowed else "p95"
     return {
@@ -398,6 +475,7 @@ def latency(metric: str, window: str = "5m") -> dict[str, Any]:
         },
         "sample_count": row.get("sample_count") or 0,
         "columns": source_columns,
+        "sources": source_latency,
     }
 
 
@@ -428,11 +506,13 @@ def _compute_retrain_loop_status(
     )
 
     # Parse Airflow schedule window
-    schedule_str = os.getenv("AIRFLOW_MODEL_RETRAIN_SCHEDULE", "*/20 * * * *")
+    schedule_str = os.getenv("AIRFLOW_MODEL_RETRAIN_SCHEDULE", "*/45 * * * *")
     match = re.fullmatch(r"\*/(\d+)\s+\*\s+\*\s+\*\s+\*", schedule_str)
-    airflow_schedule_minutes = int(match.group(1)) if match else 20
-    # Use 3x schedule window as the idle threshold (minimum 60 min for 20-min schedule)
-    data_stale_window_seconds = airflow_schedule_minutes * 180
+    airflow_schedule_minutes = int(match.group(1)) if match else 45
+    # Use 3x schedule window as the idle threshold while still reporting the real
+    # Airflow cadence separately to the dashboard.
+    idle_window_minutes = airflow_schedule_minutes * 3
+    data_stale_window_seconds = idle_window_minutes * 60
 
     # Latest event time across ALL sources (prediction + tomtom)
     latest_prediction_time: datetime | None = None
@@ -474,6 +554,7 @@ def _compute_retrain_loop_status(
 
     # Count MLflow retrain runs (cached)
     recent_failed = False
+    recent_incomplete = False
     recent_finished_count = 0
     recent_total_count = 0
     mlflow_available = False
@@ -487,17 +568,22 @@ def _compute_retrain_loop_status(
                 max_results=100,
                 order_by=["start_time DESC"],
             )
-            root_runs = []
+            latest_root_status = None
             for _, row in runs.iterrows():
                 if not _is_root_retrain_run(row):
                     continue
-                root_runs.append(row)
+                recent_total_count += 1
+                if latest_root_status is None:
+                    latest_root_status = str(row.get("status", "")).upper()
+                    if latest_root_status == "FAILED":
+                        recent_failed = True
+                    elif latest_root_status == "FINISHED" and not _root_run_is_complete(
+                        row
+                    ):
+                        recent_incomplete = True
                 status = str(row.get("status", "")).upper()
-                if status == "FAILED":
-                    recent_failed = True
-                elif status == "FINISHED":
+                if status == "FINISHED" and _root_run_is_complete(row):
                     recent_finished_count += 1
-            recent_total_count = len(root_runs)
             mlflow_available = True
     except Exception:
         pass
@@ -514,13 +600,19 @@ def _compute_retrain_loop_status(
     if recent_failed and recent_finished_count == 0:
         loop_status = "failed"
         loop_reason = "Most recent retrain run FAILED and no successful retrain completed. Airflow will retry on next tick."
+    elif recent_incomplete and recent_finished_count == 0:
+        loop_status = "failed"
+        loop_reason = (
+            "Most recent retrain run finished without logging the full top-k model set. "
+            "Treating it as FAILED until a complete retrain batch succeeds."
+        )
     elif not has_prediction_data and recent_total_count == 0:
         loop_status = "continue"
         loop_reason = "Waiting for initial data replay to begin. Replay events = 0."
     elif all_streams_stale and recent_finished_count >= MIN_RETRAIN_BATCHES_BEFORE_FINISHED:
         loop_status = "finished"
         loop_reason = (
-            f"All data streams are idle for {airflow_schedule_minutes * 3} minutes "
+            f"All data streams are idle for {idle_window_minutes} minutes "
             f"(prediction idle: {prediction_is_stale}, tomtom idle: {tomtom_is_stale}). "
             f"{recent_finished_count} retrain batches completed successfully. "
             f"Latest event: {latest_event_time.isoformat() if latest_event_time else 'N/A'}."
@@ -544,7 +636,9 @@ def _compute_retrain_loop_status(
         "latest_event_time": latest_event_time.isoformat() if latest_event_time else None,
         "latest_prediction_time": latest_prediction_time.isoformat() if latest_prediction_time else None,
         "latest_tomtom_time": latest_tomtom_time.isoformat() if latest_tomtom_time else None,
-        "schedule_window_minutes": airflow_schedule_minutes * 3,
+        "schedule_interval_minutes": airflow_schedule_minutes,
+        "schedule_window_minutes": airflow_schedule_minutes,
+        "idle_window_minutes": idle_window_minutes,
         "mlflow_available": mlflow_available,
         "has_data": has_prediction_data,
         "prediction_is_stale": prediction_is_stale,
@@ -552,6 +646,7 @@ def _compute_retrain_loop_status(
         "recent_retrain_runs": recent_total_count,
         "recent_retrain_finished": recent_finished_count,
         "min_retrain_batches_required": MIN_RETRAIN_BATCHES_BEFORE_FINISHED,
+        "latest_retrain_incomplete": recent_incomplete,
     }
     _RETRAIN_LOOP_CACHE = result
     _RETRAIN_LOOP_CACHE_TS = now_ts
@@ -617,7 +712,9 @@ def replay_health() -> dict[str, Any]:
                 "status": "continue",
                 "reason": "No source tables available yet.",
                 "latest_event_time": None,
-                "schedule_window_minutes": 30,
+                "schedule_interval_minutes": 45,
+                "schedule_window_minutes": 45,
+                "idle_window_minutes": 135,
                 "mlflow_available": False,
                 "has_data": False,
                 "data_is_stale": False,

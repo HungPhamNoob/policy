@@ -25,6 +25,8 @@ Differences from h2o_before_2020.py:
 
 import logging
 import os
+import re
+import json
 import tempfile
 import time
 from pathlib import Path
@@ -32,6 +34,9 @@ from typing import Sequence
 
 import h2o
 from h2o.automl import H2OAutoML
+from h2o.estimators.gbm import H2OGradientBoostingEstimator
+from h2o.estimators.glm import H2OGeneralizedLinearEstimator
+from h2o.estimators.naive_bayes import H2ONaiveBayesEstimator
 import mlflow
 import mlflow.h2o
 import pandas as pd
@@ -79,7 +84,30 @@ H2O_IP = os.getenv("H2O_IP", "127.0.0.1")
 H2O_PORT = int(os.getenv("H2O_PORT", "54321"))
 TOP_K_MODELS = max(1, int(os.getenv("H2O_TOP_K_MODELS", "10")))
 H2O_MAX_MODELS = max(TOP_K_MODELS, int(os.getenv("H2O_MAX_MODELS", str(TOP_K_MODELS))))
+H2O_ENFORCE_FULL_TOP_K = (
+    os.getenv("H2O_ENFORCE_FULL_TOP_K", "true").lower() == "true"
+)
+H2O_NFOLDS = int(os.getenv("H2O_NFOLDS", "0"))
+H2O_EXCLUDE_ALGOS_RAW = os.getenv(
+    "H2O_EXCLUDE_ALGOS",
+    "DeepLearning,StackedEnsemble,XGBoost",
+).strip()
+H2O_EXCLUDE_ALGOS = [
+    item.strip() for item in H2O_EXCLUDE_ALGOS_RAW.split(",") if item.strip()
+]
+H2O_TRAIN_MAX_ROWS = int(os.getenv("H2O_TRAIN_MAX_ROWS", "2000000"))
+H2O_EVAL_MAX_ROWS = int(os.getenv("H2O_EVAL_MAX_ROWS", "25000"))
+H2O_MAX_AFTER_BALANCE_SIZE = float(os.getenv("H2O_MAX_AFTER_BALANCE_SIZE", "1.0"))
+H2O_MAX_RUNTIME_SECS_PER_MODEL = int(os.getenv("H2O_MAX_RUNTIME_SECS_PER_MODEL", "120"))
+H2O_BALANCE_CLASSES = os.getenv("H2O_BALANCE_CLASSES", "false").lower() == "true"
+H2O_FALLBACK_PER_MODEL_RUNTIME_SECS = int(
+    os.getenv(
+        "H2O_FALLBACK_PER_MODEL_RUNTIME_SECS",
+        str(max(20, min(H2O_MAX_RUNTIME_SECS_PER_MODEL, 60))),
+    )
+)
 RETRAIN_BATCH_ID = os.getenv("RETRAIN_BATCH_ID", os.getenv("SPARK_BATCH_ID", "")).strip()
+NODE3_STATUS_FILE = os.getenv("NODE3_STATUS_FILE", "").strip()
 USE_CLASS_SAMPLING_FACTORS = (
     os.getenv("H2O_USE_CLASS_SAMPLING_FACTORS", "true").lower() == "true"
 )
@@ -100,6 +128,7 @@ EXCLUDED_COLUMNS = {
 }
 
 SEED = int(os.getenv("H2O_SEED", "42"))
+VALID_INCREMENTAL_BATCH_PATTERN = re.compile(r"^\d{8}T\d+Z$")
 
 
 # ============================================================
@@ -306,6 +335,329 @@ def build_class_sampling_factors(label_distribution) -> tuple[list[float] | None
     return factors, metadata
 
 
+def sample_frame_rows(
+    frame: h2o.H2OFrame,
+    frac: float,
+    seed: int,
+    reason: str,
+) -> h2o.H2OFrame:
+    """
+    Return a sampled subset without materializing an explicit complement frame.
+
+    `split_frame()` creates both sides of the split, which was causing avoidable
+    heap pressure on the small Node3 retraining VM. Here we only keep the rows
+    we actually need.
+    """
+    bounded_frac = max(0.0001, min(1.0, float(frac)))
+    if bounded_frac >= 1.0:
+        return frame
+
+    logger.info(
+        "Sampling %s with frac=%.6f via runif filter to avoid extra H2O split frames.",
+        reason,
+        bounded_frac,
+    )
+    selector_key = f"selector_{re.sub(r'[^a-z0-9]+', '_', reason.lower())}_{seed}_{int(time.time() * 1000)}"
+    selector = h2o.assign(frame.runif(seed=seed), selector_key)
+    sampled = frame[selector <= bounded_frac]
+    return sampled
+
+
+def _safe_float(value, default=float("inf")) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return default
+    if numeric != numeric:
+        return default
+    return numeric
+
+
+def write_runtime_status(
+    *,
+    phase: str,
+    message: str,
+    status: str = "continue",
+    models_logged: int | None = None,
+) -> None:
+    """Best-effort heartbeat updates for the Node3 status file during H2O work."""
+    if not NODE3_STATUS_FILE:
+        return
+
+    try:
+        status_path = Path(NODE3_STATUS_FILE)
+        payload: dict = {}
+        if status_path.exists():
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+
+        payload["status"] = status
+        payload["phase"] = phase
+        payload["message"] = message
+        payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        payload["pid"] = os.getpid()
+        if RETRAIN_BATCH_ID:
+            payload["batch_id"] = RETRAIN_BATCH_ID
+        if models_logged is not None:
+            payload["models_logged"] = int(models_logged)
+
+        status_path.parent.mkdir(parents=True, exist_ok=True)
+        status_path.write_text(
+            json.dumps(payload, ensure_ascii=True, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logger.warning("Could not update runtime status file %s: %s", NODE3_STATUS_FILE, exc)
+
+
+def collect_candidate_record(model, test_frame) -> dict:
+    """Evaluate a model on the held-out test frame for consistent ranking."""
+    performance = model.model_performance(test_frame)
+    return {
+        "model": model,
+        "model_id": model.model_id,
+        "algo": model.algo,
+        "mean_per_class_error": _safe_float(
+            getattr(performance, "mean_per_class_error", lambda: None)()
+        ),
+        "logloss": _safe_float(getattr(performance, "logloss", lambda: None)()),
+        "rmse": _safe_float(getattr(performance, "rmse", lambda: None)()),
+        "mse": _safe_float(getattr(performance, "mse", lambda: None)()),
+    }
+
+
+def candidate_sort_key(candidate: dict) -> tuple[float, float, str]:
+    return (
+        _safe_float(candidate.get("mean_per_class_error")),
+        _safe_float(candidate.get("logloss")),
+        str(candidate.get("model_id") or ""),
+    )
+
+
+def fallback_model_specs(seed: int) -> list[dict]:
+    """Deterministic lightweight model plan used when AutoML under-fills the top-k."""
+    return [
+        {
+            "algo": "gbm",
+            "model_id": f"fallback_gbm_depth4_lr005_{seed}",
+            "estimator": H2OGradientBoostingEstimator,
+            "params": {
+                "ntrees": 180,
+                "max_depth": 4,
+                "learn_rate": 0.05,
+                "sample_rate": 0.8,
+                "col_sample_rate": 0.8,
+                "stopping_metric": "mean_per_class_error",
+                "distribution": "multinomial",
+                "max_runtime_secs": H2O_FALLBACK_PER_MODEL_RUNTIME_SECS,
+                "seed": seed,
+            },
+        },
+        {
+            "algo": "gbm",
+            "model_id": f"fallback_gbm_depth6_lr003_{seed}",
+            "estimator": H2OGradientBoostingEstimator,
+            "params": {
+                "ntrees": 240,
+                "max_depth": 6,
+                "learn_rate": 0.03,
+                "sample_rate": 0.75,
+                "col_sample_rate": 0.75,
+                "stopping_metric": "mean_per_class_error",
+                "distribution": "multinomial",
+                "max_runtime_secs": H2O_FALLBACK_PER_MODEL_RUNTIME_SECS,
+                "seed": seed + 1,
+            },
+        },
+        {
+            "algo": "gbm",
+            "model_id": f"fallback_gbm_depth8_lr002_{seed}",
+            "estimator": H2OGradientBoostingEstimator,
+            "params": {
+                "ntrees": 320,
+                "max_depth": 8,
+                "learn_rate": 0.02,
+                "sample_rate": 0.7,
+                "col_sample_rate": 0.7,
+                "stopping_metric": "mean_per_class_error",
+                "distribution": "multinomial",
+                "max_runtime_secs": H2O_FALLBACK_PER_MODEL_RUNTIME_SECS,
+                "seed": seed + 2,
+            },
+        },
+        {
+            "algo": "gbm",
+            "model_id": f"fallback_gbm_depth5_lr01_{seed}",
+            "estimator": H2OGradientBoostingEstimator,
+            "params": {
+                "ntrees": 140,
+                "max_depth": 5,
+                "learn_rate": 0.1,
+                "sample_rate": 0.8,
+                "col_sample_rate": 0.8,
+                "stopping_metric": "mean_per_class_error",
+                "distribution": "multinomial",
+                "max_runtime_secs": H2O_FALLBACK_PER_MODEL_RUNTIME_SECS,
+                "seed": seed + 3,
+            },
+        },
+        {
+            "algo": "gbm",
+            "model_id": f"fallback_gbm_depth3_lr015_{seed}",
+            "estimator": H2OGradientBoostingEstimator,
+            "params": {
+                "ntrees": 120,
+                "max_depth": 3,
+                "learn_rate": 0.15,
+                "sample_rate": 0.85,
+                "col_sample_rate": 0.85,
+                "stopping_metric": "mean_per_class_error",
+                "distribution": "multinomial",
+                "max_runtime_secs": H2O_FALLBACK_PER_MODEL_RUNTIME_SECS,
+                "seed": seed + 4,
+            },
+        },
+        {
+            "algo": "gbm",
+            "model_id": f"fallback_gbm_depth7_lr004_{seed}",
+            "estimator": H2OGradientBoostingEstimator,
+            "params": {
+                "ntrees": 260,
+                "max_depth": 7,
+                "learn_rate": 0.04,
+                "sample_rate": 0.75,
+                "col_sample_rate": 0.75,
+                "stopping_metric": "mean_per_class_error",
+                "distribution": "multinomial",
+                "max_runtime_secs": H2O_FALLBACK_PER_MODEL_RUNTIME_SECS,
+                "seed": seed + 5,
+            },
+        },
+        {
+            "algo": "glm",
+            "model_id": f"fallback_glm_alpha0025_{seed}",
+            "estimator": H2OGeneralizedLinearEstimator,
+            "params": {
+                "family": "multinomial",
+                "alpha": [0.025],
+                "lambda_search": True,
+                "standardize": True,
+                "seed": seed + 6,
+            },
+        },
+        {
+            "algo": "glm",
+            "model_id": f"fallback_glm_alpha0_{seed}",
+            "estimator": H2OGeneralizedLinearEstimator,
+            "params": {
+                "family": "multinomial",
+                "alpha": [0.0],
+                "lambda_search": True,
+                "standardize": True,
+                "seed": seed + 7,
+            },
+        },
+        {
+            "algo": "glm",
+            "model_id": f"fallback_glm_alpha05_{seed}",
+            "estimator": H2OGeneralizedLinearEstimator,
+            "params": {
+                "family": "multinomial",
+                "alpha": [0.5],
+                "lambda_search": True,
+                "standardize": True,
+                "seed": seed + 8,
+            },
+        },
+        {
+            "algo": "glm",
+            "model_id": f"fallback_glm_alpha1_{seed}",
+            "estimator": H2OGeneralizedLinearEstimator,
+            "params": {
+                "family": "multinomial",
+                "alpha": [1.0],
+                "lambda_search": True,
+                "standardize": True,
+                "seed": seed + 9,
+            },
+        },
+        {
+            "algo": "naivebayes",
+            "model_id": f"fallback_nb_laplace1_{seed}",
+            "estimator": H2ONaiveBayesEstimator,
+            "params": {
+                "laplace": 1.0,
+                "min_sdev": 0.001,
+                "eps_sdev": 0.0,
+            },
+        },
+        {
+            "algo": "naivebayes",
+            "model_id": f"fallback_nb_laplace05_{seed}",
+            "estimator": H2ONaiveBayesEstimator,
+            "params": {
+                "laplace": 0.5,
+                "min_sdev": 0.001,
+                "eps_sdev": 0.0,
+            },
+        },
+        {
+            "algo": "naivebayes",
+            "model_id": f"fallback_nb_laplace2_{seed}",
+            "estimator": H2ONaiveBayesEstimator,
+            "params": {
+                "laplace": 2.0,
+                "min_sdev": 0.001,
+                "eps_sdev": 0.0,
+            },
+        },
+    ]
+
+
+def train_fallback_candidates(
+    train,
+    test,
+    feature_columns: list[str],
+    existing_model_ids: set[str],
+    required_total: int,
+) -> list[dict]:
+    """Train additional deterministic candidates when AutoML does not fill the top-k."""
+    candidates: list[dict] = []
+    missing = max(0, required_total - len(existing_model_ids))
+    if missing <= 0:
+        return candidates
+
+    logger.warning(
+        "AutoML produced fewer than %s unique models; training fallback candidates to fill the leaderboard.",
+        required_total,
+    )
+    for spec in fallback_model_specs(SEED):
+        model_id = spec["model_id"]
+        if model_id in existing_model_ids:
+            continue
+
+        estimator = spec["estimator"](model_id=model_id, **spec["params"])
+        logger.info("Training fallback candidate %s (%s)...", model_id, spec["algo"])
+        try:
+            estimator.train(x=feature_columns, y=LABEL_COLUMN, training_frame=train)
+            candidate = collect_candidate_record(estimator, test)
+        except Exception as exc:
+            logger.warning("Fallback candidate %s failed: %s", model_id, exc)
+            continue
+
+        logger.info(
+            "Fallback candidate ready: %s mean_per_class_error=%.6f logloss=%.6f",
+            candidate["model_id"],
+            candidate["mean_per_class_error"],
+            candidate["logloss"],
+        )
+        candidates.append(candidate)
+        existing_model_ids.add(candidate["model_id"])
+        if len(existing_model_ids) >= required_total:
+            break
+
+    return candidates
+
+
 # ============================================================
 # Find latest retrain data on GCS
 # ============================================================
@@ -326,6 +678,7 @@ def find_latest_data(data_root: str) -> str | list[str]:
                     path
                     for extension in ("*.csv", "*.parquet")
                     for path in local_path.rglob(extension)
+                    if not _should_skip_local_training_file(path, local_path)
                 ],
                 key=lambda path: path.stat().st_mtime,
             )
@@ -389,6 +742,24 @@ def find_latest_data(data_root: str) -> str | list[str]:
         )
 
 
+def _should_skip_local_training_file(path: Path, data_root: Path) -> bool:
+    """Skip ad-hoc local test batches that should not enter cumulative retraining."""
+    try:
+        relative_parts = path.relative_to(data_root).parts
+    except ValueError:
+        relative_parts = path.parts
+
+    if "incremental_batches" not in relative_parts:
+        return False
+
+    batch_index = relative_parts.index("incremental_batches") + 1
+    if batch_index >= len(relative_parts):
+        return False
+
+    batch_id = relative_parts[batch_index]
+    return not VALID_INCREMENTAL_BATCH_PATTERN.match(batch_id)
+
+
 # ============================================================
 # Main training function
 # ============================================================
@@ -415,6 +786,16 @@ def main():
     logger.info("H2O threads:             %s", H2O_NTHREADS)
     logger.info("Random seed:             %s", SEED)
     logger.info("Retrain batch ID:        %s", RETRAIN_BATCH_ID or "(not provided)")
+    logger.info("H2O nfolds:              %s", H2O_NFOLDS)
+    logger.info("H2O exclude algos:       %s", H2O_EXCLUDE_ALGOS or "[]")
+    logger.info("H2O balance classes:     %s", H2O_BALANCE_CLASSES)
+    if H2O_TRAIN_MAX_ROWS > 0:
+        logger.info("H2O train max rows:      %s", f"{H2O_TRAIN_MAX_ROWS:,}")
+    else:
+        logger.info("H2O train max rows:      disabled")
+    logger.info("H2O max after balance:   %s", H2O_MAX_AFTER_BALANCE_SIZE)
+    logger.info("H2O max secs / model:    %s", H2O_MAX_RUNTIME_SECS_PER_MODEL)
+    logger.info("Fallback secs / model:   %s", H2O_FALLBACK_PER_MODEL_RUNTIME_SECS)
 
     # ---- Step 1: Initialize H2O cluster ----
     logger.info("Step 1: Initializing H2O cluster...")
@@ -453,18 +834,69 @@ def main():
 
     # ---- Step 4: Train/test split ----
     logger.info("Step 4: Splitting into train/test (80/20)...")
-    train, test = df_h2o.split_frame(ratios=[0.8], seed=SEED)
-    logger.info("Training rows:   %s", f"{train.nrows:,}")
-    logger.info("Test rows:       %s", f"{test.nrows:,}")
-
-    # ---- Step 5: Define features ----
     feature_columns = [c for c in df_h2o.columns if c not in EXCLUDED_COLUMNS]
     logger.info("Feature columns (%s): %s", len(feature_columns), feature_columns)
     logger.info("Label column:         %s", LABEL_COLUMN)
 
+    sampled_source = df_h2o
+    if H2O_TRAIN_MAX_ROWS > 0:
+        target_total_rows = int(H2O_TRAIN_MAX_ROWS / 0.8)
+        if sampled_source.nrows > target_total_rows:
+            frac = target_total_rows / float(sampled_source.nrows)
+            logger.warning(
+                "Sampling source frame from %s rows to ~%s rows before train/test split (frac=%.6f) for stability.",
+                f"{sampled_source.nrows:,}",
+                f"{target_total_rows:,}",
+                frac,
+            )
+            sampled_source = sample_frame_rows(
+                sampled_source,
+                frac=frac,
+                seed=SEED,
+                reason="source retrain frame",
+            )
+            logger.info(
+                "Sampled source rows: %s",
+                f"{sampled_source.nrows:,}",
+            )
+
+    split_selector = h2o.assign(
+        sampled_source.runif(seed=SEED),
+        f"selector_train_test_{SEED}_{int(time.time() * 1000)}",
+    )
+    train = sampled_source[split_selector <= 0.8]
+    test = sampled_source[split_selector > 0.8]
+
+    if H2O_TRAIN_MAX_ROWS > 0 and train.nrows > H2O_TRAIN_MAX_ROWS:
+        frac = H2O_TRAIN_MAX_ROWS / float(train.nrows)
+        logger.warning(
+            "Downsampling train frame from %s rows to ~%s rows (frac=%.6f) for stability.",
+            f"{train.nrows:,}",
+            f"{H2O_TRAIN_MAX_ROWS:,}",
+            frac,
+        )
+        train = sample_frame_rows(
+            train,
+            frac=frac,
+            seed=SEED,
+            reason="training frame",
+        )
+    logger.info("Training rows:   %s", f"{train.nrows:,}")
+    logger.info("Test rows:       %s", f"{test.nrows:,}")
+    if sampled_source is not df_h2o:
+        try:
+            h2o.remove(df_h2o.frame_id)
+        except Exception:
+            pass
+
     # ---- Step 6: Train H2O AutoML ----
     logger.info("Step 6: Starting H2O AutoML retraining...")
     logger.info("Max runtime: %s seconds", MAX_RUNTIME_SECS)
+    write_runtime_status(
+        phase="h2o",
+        message="H2O AutoML retraining started.",
+        models_logged=0,
+    )
 
     with mlflow.start_run(run_name="h2o_retrain_online") as run:
         run_id = run.info.run_id
@@ -477,8 +909,16 @@ def main():
         mlflow.log_param("run_type", "retrain_online")
         mlflow.log_param("top_k_models", TOP_K_MODELS)
         mlflow.log_param("max_models", H2O_MAX_MODELS)
+        mlflow.log_param("enforce_full_top_k", H2O_ENFORCE_FULL_TOP_K)
         mlflow.log_param("max_runtime_secs", MAX_RUNTIME_SECS)
         mlflow.log_param("seed", SEED)
+        mlflow.log_param("nfolds", H2O_NFOLDS)
+        mlflow.log_param("exclude_algos", ",".join(H2O_EXCLUDE_ALGOS))
+        mlflow.log_param("balance_classes", H2O_BALANCE_CLASSES)
+        mlflow.log_param("train_max_rows", H2O_TRAIN_MAX_ROWS)
+        mlflow.log_param("eval_max_rows", H2O_EVAL_MAX_ROWS)
+        mlflow.log_param("max_after_balance_size", H2O_MAX_AFTER_BALANCE_SIZE)
+        mlflow.log_param("max_runtime_secs_per_model", H2O_MAX_RUNTIME_SECS_PER_MODEL)
         mlflow.log_param("n_features", len(feature_columns))
         mlflow.log_param("n_train_rows", train.nrows)
         mlflow.log_param("n_test_rows", test.nrows)
@@ -501,14 +941,18 @@ def main():
 
         automl_parameters = {
             "max_runtime_secs": MAX_RUNTIME_SECS,
+            "max_runtime_secs_per_model": H2O_MAX_RUNTIME_SECS_PER_MODEL,
             "max_models": H2O_MAX_MODELS,
             "seed": SEED,
             "project_name": "traffic_risk_retrain",
-            "balance_classes": True,
-            "max_after_balance_size": 5.0,
+            "balance_classes": H2O_BALANCE_CLASSES,
+            "max_after_balance_size": H2O_MAX_AFTER_BALANCE_SIZE,
             "sort_metric": "mean_per_class_error",
+            "nfolds": H2O_NFOLDS,
         }
-        if class_sampling_factors:
+        if H2O_EXCLUDE_ALGOS:
+            automl_parameters["exclude_algos"] = H2O_EXCLUDE_ALGOS
+        if H2O_BALANCE_CLASSES and class_sampling_factors:
             automl_parameters["class_sampling_factors"] = class_sampling_factors
 
         aml = H2OAutoML(**automl_parameters)
@@ -520,23 +964,83 @@ def main():
         )
 
         logger.info("Training completed.")
+        write_runtime_status(
+            phase="h2o",
+            message="AutoML search completed. Ranking candidate models.",
+            models_logged=0,
+        )
 
         # ---- Step 7: Leaderboard ----
         lb = aml.leaderboard
-        lb_df = lb.head(rows=TOP_K_MODELS).as_data_frame()
-        logger.info("H2O AutoML leaderboard (top %s):\n%s", TOP_K_MODELS, lb_df)
+        lb_df = lb.as_data_frame()
+        logger.info("H2O AutoML leaderboard:\n%s", lb_df.head(TOP_K_MODELS))
 
         # ---- Step 8: Evaluate and log top 10 models ----
-        top_model_ids = lb_df["model_id"].tolist()[:TOP_K_MODELS]
-        if not top_model_ids:
+        automl_model_ids = lb_df["model_id"].tolist()
+        if not automl_model_ids:
             raise RuntimeError("H2O AutoML produced no leaderboard models.")
-        if len(top_model_ids) < TOP_K_MODELS:
-            logger.warning(
-                "AutoML returned %s models, fewer than requested top-%s. "
-                "Increase H2O_MAX_RUNTIME or investigate failed algorithms.",
-                len(top_model_ids),
-                TOP_K_MODELS,
+        candidate_records = []
+        seen_model_ids: set[str] = set()
+        for model_id in automl_model_ids:
+            if model_id in seen_model_ids:
+                continue
+            candidate_records.append(
+                collect_candidate_record(h2o.get_model(model_id), test)
             )
+            seen_model_ids.add(model_id)
+
+        if len(candidate_records) < TOP_K_MODELS:
+            message = (
+                f"AutoML returned only {len(candidate_records)} unique models, fewer than "
+                f"the required top-{TOP_K_MODELS}. Training fallback candidates."
+            )
+            logger.warning(message)
+            mlflow.set_tag("fallback_top_k_fill", "true")
+            candidate_records.extend(
+                train_fallback_candidates(
+                    train,
+                    test,
+                    feature_columns,
+                    seen_model_ids,
+                    TOP_K_MODELS,
+                )
+            )
+
+        candidate_records.sort(key=candidate_sort_key)
+        ranking_df = pd.DataFrame(
+            [
+                {
+                    "model_id": candidate["model_id"],
+                    "algo": candidate["algo"],
+                    "mean_per_class_error": candidate["mean_per_class_error"],
+                    "logloss": candidate["logloss"],
+                    "rmse": candidate["rmse"],
+                    "mse": candidate["mse"],
+                }
+                for candidate in candidate_records
+            ]
+        )
+        logger.info(
+            "Combined candidate leaderboard (top %s):\n%s",
+            TOP_K_MODELS,
+            ranking_df.head(TOP_K_MODELS),
+        )
+
+        top_candidates = candidate_records[:TOP_K_MODELS]
+        top_model_ids = [candidate["model_id"] for candidate in top_candidates]
+        write_runtime_status(
+            phase="logging_models",
+            message=f"Evaluating and logging top {len(top_model_ids)} models.",
+            models_logged=0,
+        )
+        if len(top_model_ids) < TOP_K_MODELS:
+            message = (
+                f"Only {len(top_model_ids)} models were available after fallback training, "
+                f"still below the required top-{TOP_K_MODELS}."
+            )
+            if H2O_ENFORCE_FULL_TOP_K:
+                raise RuntimeError(message)
+            logger.warning(message)
         logger.info(
             "Step 8: Evaluating and logging top %s models...", len(top_model_ids)
         )
@@ -547,8 +1051,9 @@ def main():
         best_logloss = float("inf")
         best_metrics = {}
 
-        for rank, model_id in enumerate(top_model_ids, start=1):
-            model = h2o.get_model(model_id)
+        for rank, candidate in enumerate(top_candidates, start=1):
+            model_id = candidate["model_id"]
+            model = candidate["model"]
             model_perf = model.model_performance(test)
             sklearn_metrics, report_df, confusion_df = evaluate_classifier_with_sklearn(
                 model,
@@ -581,6 +1086,10 @@ def main():
                 mlflow.log_param("rank", rank)
                 mlflow.log_param("model_id", model_id)
                 mlflow.log_param("algo", model.algo)
+                mlflow.log_param(
+                    "leaderboard_source",
+                    "automl" if model_id in automl_model_ids else "fallback",
+                )
                 if RETRAIN_BATCH_ID:
                     mlflow.log_param("retrain_batch_id", RETRAIN_BATCH_ID)
 
@@ -610,6 +1119,11 @@ def main():
                     pass
 
                 mlflow.h2o.log_model(model, artifact_path=f"retrain_model_rank{rank}")
+                write_runtime_status(
+                    phase="logging_models",
+                    message=f"Logged retrain top {rank}/{len(top_candidates)}: {model_id}",
+                    models_logged=rank,
+                )
 
         # ---- Step 9: Register best model ----
         if best_model is None or not best_metrics:
@@ -628,11 +1142,18 @@ def main():
         mlflow.log_param("best_model_rank", best_rank)
         mlflow.log_param("best_model_id", best_model.model_id)
         mlflow.log_param("best_model_algo", best_model.algo)
+        mlflow.log_param("candidate_models_available", len(candidate_records))
+        mlflow.log_metric("models_logged", len(top_model_ids))
         mlflow.log_metric("logloss", best_logloss)
         for metric_name, metric_value in best_metrics.items():
             mlflow.log_metric(metric_name, metric_value)
 
         mlflow.h2o.log_model(best_model, artifact_path="best_model")
+        write_runtime_status(
+            phase="registering_model",
+            message=f"Registering best model {best_model.model_id}.",
+            models_logged=len(top_model_ids),
+        )
 
         model_uri = f"runs:/{run_id}/best_model"
         registered_model = mlflow.register_model(model_uri, MODEL_NAME)
@@ -643,6 +1164,11 @@ def main():
         )
 
         logger.info("Flink will automatically load models:/%s/latest", MODEL_NAME)
+        write_runtime_status(
+            phase="completed",
+            message="H2O retraining finished successfully.",
+            models_logged=len(top_model_ids),
+        )
 
     # ---- Cleanup ----
     logger.info("Shutting down H2O cluster...")

@@ -42,6 +42,14 @@ function formatPercent(value: unknown) {
   return `${(value * 100).toFixed(2)}%`;
 }
 
+function formatMs(value: unknown) {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return "n/a";
+  }
+  return `${value.toFixed(1)}ms`;
+}
+
+
 export default function PipelinePage() {
   const health = useQuery({ queryKey: ["health"], queryFn: api.health });
   const system = useQuery({
@@ -72,7 +80,7 @@ export default function PipelinePage() {
   });
   const retrain = useQuery({
     queryKey: ["retrain"],
-    queryFn: () => api.retrainHistory(30),
+    queryFn: () => api.retrainHistory(60),
     refetchInterval: 60_000
   });
   const trend = useQuery({
@@ -96,6 +104,7 @@ export default function PipelinePage() {
         value
       }))
     : [];
+  const latencySources = (latencyData?.sources as AnyRecord | undefined) || {};
   const trendSeries = (trendData?.series as AnyRecord[] | undefined) || [];
   const replaySources = (replayData?.sources as AnyRecord[] | undefined) || [];
   const rawRetrainRuns = (retrainData?.runs as AnyRecord[] | undefined) || [];
@@ -129,6 +138,14 @@ export default function PipelinePage() {
       [systemData?.kafka?.us_topic, systemData?.kafka?.tomtom_topic]
         .filter(Boolean)
         .join(" | ")
+    ],
+    [
+      "TomTom live",
+      "kafka",
+      systemData?.tomtom_live?.status,
+      systemData?.tomtom_live?.credentials_configured
+        ? `poll: ${systemData?.tomtom_live?.poll_seconds || "n/a"}s | flush: ${systemData?.tomtom_live?.flush_interval_seconds || "n/a"}s`
+        : systemData?.tomtom_live?.note || "TomTom producer is idle"
     ],
     ["Flink", "flink", systemData?.flink?.status, systemData?.flink?.checkpoint_dir],
     ["Spark", "spark", "configured", systemData?.spark?.gold_path],
@@ -169,11 +186,23 @@ export default function PipelinePage() {
   const latencyDetail =
     latencyData?.status === "stale" && latencyData?.window_anchor
       ? formatVietnamTimestampLabel("Latest active window ended", latencyData.window_anchor)
-      : statusText(latencyData);
+      : Object.entries(latencySources)
+          .map(([table, stats]) => {
+            const sourceStats = stats as AnyRecord;
+            return `${table}: ${String(sourceStats.latency_column || "latency")} p95 ${formatMs(sourceStats.p95)}`;
+          })
+          .join(" | ") || statusText(latencyData);
   const avgLatencyDetail =
     latencyData?.status === "stale" && latencyData?.window_anchor
       ? formatVietnamTimestampLabel("Latest active window ended", latencyData.window_anchor)
-      : `Recent window: ${String(latencyData?.window || "5m")}`;
+      : `${`Recent window: ${String(latencyData?.window || "5m")}`} | ${
+          Object.entries(latencySources)
+            .map(([table, stats]) => {
+              const sourceStats = stats as AnyRecord;
+              return `${table}: avg ${formatMs(sourceStats.avg)}`;
+            })
+            .join(" | ") || "No source breakdown"
+        }`;
 
   return (
     <div className="page-stack">
@@ -356,32 +385,100 @@ export default function PipelinePage() {
 
       <section className="card">
         <h2 className="card-title">Retrain history</h2>
-        <table className="table">
-          <thead>
-            <tr>
-              <th>Run</th>
-              <th>Status</th>
-              <th>Start</th>
-              <th>Accuracy</th>
-              <th>F1</th>
-              <th>Recall</th>
-              <th>Precision</th>
-            </tr>
-          </thead>
-          <tbody>
-            {retrainHistoryRows.map((run) => (
-              <tr key={run.run_id}>
-                <td className="mono">{run.run_name || run.run_id}</td>
-                <td>{run.status}</td>
-                <td>{formatVietnamTimestamp(run.start_time, "-")}</td>
-                <td>{formatPercent(run.metrics?.accuracy)}</td>
-                <td>{formatPercent(run.metrics?.weighted_f1 ?? run.metrics?.f1)}</td>
-                <td>{formatPercent(run.metrics?.weighted_recall ?? run.metrics?.recall)}</td>
-                <td>{formatPercent(run.metrics?.weighted_precision ?? run.metrics?.precision)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        <div style={{ display: "grid", gap: 16 }}>
+          {retrainHistoryRows.map((run) => {
+            const children = Array.isArray(run.leaderboard_models) ? run.leaderboard_models : [];
+            return (
+              <div
+                key={String(run.run_id || run.run_name)}
+                style={{
+                  border: "1px solid rgba(148, 163, 184, 0.18)",
+                  borderRadius: 8,
+                  overflow: "hidden"
+                }}
+              >
+                <table className="table" style={{ marginBottom: 0 }}>
+                  <thead>
+                    <tr>
+                      <th>Run</th>
+                      <th>Status</th>
+                      <th>Start</th>
+                      <th>Accuracy</th>
+                      <th>F1</th>
+                      <th>Recall</th>
+                      <th>Precision</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td className="mono">
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                          <span>{run.run_name || run.run_id}</span>
+                          {run.retrain_batch_id ? (
+                            <span className="muted">batch: {String(run.retrain_batch_id)}</span>
+                          ) : null}
+                          <span className="muted">models: {children.length}</span>
+                        </div>
+                      </td>
+                      <td>{run.status}</td>
+                      <td>{formatVietnamTimestamp(run.start_time, "-")}</td>
+                      <td>{formatPercent(run.metrics?.accuracy)}</td>
+                      <td>{formatPercent(run.metrics?.weighted_f1 ?? run.metrics?.f1)}</td>
+                      <td>{formatPercent(run.metrics?.weighted_recall ?? run.metrics?.recall)}</td>
+                      <td>{formatPercent(run.metrics?.weighted_precision ?? run.metrics?.precision)}</td>
+                    </tr>
+                  </tbody>
+                </table>
+                {children.length ? (
+                  <div style={{ borderTop: "1px solid rgba(148, 163, 184, 0.18)" }}>
+                    <div
+                      style={{
+                        padding: "10px 12px",
+                        fontSize: 12,
+                        color: "#94a3b8",
+                        textTransform: "uppercase",
+                        letterSpacing: 0
+                      }}
+                    >
+                      Leaderboard models
+                    </div>
+                    <table className="table" style={{ marginBottom: 0 }}>
+                      <thead>
+                        <tr>
+                          <th>Model run</th>
+                          <th>Status</th>
+                          <th>Start</th>
+                          <th>Accuracy</th>
+                          <th>F1</th>
+                          <th>Recall</th>
+                          <th>Precision</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {children.map((child: AnyRecord) => (
+                          <tr key={`${String(run.run_id || run.run_name)}:${String(child.run_id || child.run_name)}`}>
+                            <td className="mono">
+                              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                                <span>{child.run_name || child.run_id}</span>
+                                <span className="muted">{`rank #${child.rank ?? "?"} | ${child.model_id || "unknown_model"} | ${child.algo || "unknown_algo"}`}</span>
+                              </div>
+                            </td>
+                            <td>{child.status}</td>
+                            <td>{formatVietnamTimestamp(child.start_time, "-")}</td>
+                            <td>{formatPercent(child.metrics?.accuracy)}</td>
+                            <td>{formatPercent(child.metrics?.weighted_f1 ?? child.metrics?.f1)}</td>
+                            <td>{formatPercent(child.metrics?.weighted_recall ?? child.metrics?.recall)}</td>
+                            <td>{formatPercent(child.metrics?.weighted_precision ?? child.metrics?.precision)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
       </section>
     </div>
   );

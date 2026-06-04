@@ -29,9 +29,12 @@ echo "Environment file: ${ENV_FILE}"
 cd "${PROJECT_ROOT}"
 
 if [ -f "${ENV_FILE}" ]; then
-  set -a
-  . "${ENV_FILE}"
-  set +a
+  while IFS= read -r line; do
+    case "${line}" in
+      ''|\#*) continue ;;
+      *=*) export "${line}" ;;
+    esac
+  done < "${ENV_FILE}"
 else
   echo "ERROR: ${ENV_FILE} does not exist."
   exit 1
@@ -141,17 +144,47 @@ ensure_ssh_key_mount_source() {
   local resolved_path=""
   local candidate_paths=()
   local target_user="${HUNG_SSH_USER:-$(whoami)}"
+  local candidate_path=""
+
+  resolve_candidate_key_file() {
+    local raw_path="$1"
+    if [ -z "${raw_path}" ]; then
+      return 1
+    fi
+    if [ -f "${raw_path}" ]; then
+      printf '%s\n' "${raw_path}"
+      return 0
+    fi
+    if [ -d "${raw_path}" ]; then
+      local discovered_file=""
+      for discovered_file in \
+        "${raw_path}/traffic-inter-node.key" \
+        "${raw_path}/google_compute_engine" \
+        "${raw_path}/id_rsa"; do
+        if [ -f "${discovered_file}" ]; then
+          printf '%s\n' "${discovered_file}"
+          return 0
+        fi
+      done
+      discovered_file="$(find "${raw_path}" -maxdepth 2 -type f 2>/dev/null | head -n 1 || true)"
+      if [ -n "${discovered_file}" ] && [ -f "${discovered_file}" ]; then
+        printf '%s\n' "${discovered_file}"
+        return 0
+      fi
+    fi
+    return 1
+  }
 
   if [ -n "${configured_path}" ]; then
     candidate_paths+=("${configured_path}")
   fi
   candidate_paths+=("${HOME}/.ssh/google_compute_engine")
   candidate_paths+=("/home/${target_user}/.ssh/google_compute_engine")
+  candidate_paths+=("${PROJECT_ROOT}/secrets/inter_node_google_compute_engine")
 
-  local candidate_path
   for candidate_path in "${candidate_paths[@]}"; do
-    if [ -n "${candidate_path}" ] && [ -f "${candidate_path}" ]; then
-      resolved_path="${candidate_path}"
+    resolved_path="$(resolve_candidate_key_file "${candidate_path}" || true)"
+    if [ -n "${resolved_path}" ]; then
       break
     fi
   done
@@ -161,7 +194,7 @@ ensure_ssh_key_mount_source() {
     return 0
   fi
 
-  if [ -n "${configured_path}" ] && [ "${configured_path}" != "${resolved_path}" ]; then
+  if [ -n "${configured_path}" ] && [ ! -d "${configured_path}" ] && [ "${configured_path}" != "${resolved_path}" ]; then
     echo "Linking ${configured_path} -> ${resolved_path} for container SSH access."
     mkdir -p "$(dirname "${configured_path}")"
     ln -sfn "${resolved_path}" "${configured_path}"
@@ -194,7 +227,7 @@ ensure_inter_node_ssh_access() {
   local node_name
   for node_name in node2-streaming node3-batch; do
     echo "Authorizing the shared SSH key on ${node_name} for user ${target_user}."
-    gcloud compute ssh "${node_name}" \
+    gcloud compute ssh "${target_user}@${node_name}" \
       --zone="${zone}" \
       --project="${project_id}" \
       --quiet \

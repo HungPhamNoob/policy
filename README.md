@@ -119,7 +119,7 @@ This repository implements the **complete end-to-end data and ML pipeline**:
 │    → Silver JSONL + PostgreSQL traffic_risk_predictions             │
 │    → Spark batch cleaning / dedup / partitioning                   │
 │    → Gold Parquet + CSV                                            │
-│    → H2O AutoML retraining (20-minute Airflow schedule)            │
+│    → H2O AutoML retraining (45-minute Airflow schedule)            │
 │    → MLflow Model Registry (updated)                               │
 └─────────────────────────────────────────────────────────────────────┘
 
@@ -157,7 +157,7 @@ The pipeline uses a **strict temporal split** to prevent data leakage:
 
 **Design principles:**
 - `before 2020` → Offline model selection and initial training only
-- `from 2020` → Replay simulation, online inference, and 15-minute retraining inputs
+- `from 2020` → Replay simulation, online inference, and 45-minute retraining inputs
 - No overlap ensures the model never sees future data during training
 
 ---
@@ -185,7 +185,7 @@ Key findings that shaped modeling decisions:
 | **ML Inference** | US events: H2O model served via MLflow; TomTom: rule-based severity from delay/icon signals |
 | **Batch** | Spark validates schema, fills defaults, removes duplicates, writes Gold Parquet/CSV |
 | **Retraining** | H2O AutoML trains/retrains severity models; MLflow logs experiments and tracks model versions |
-| **Orchestration** | Airflow triggers 15-minute retraining and 2-minute stream health-check DAGs |
+| **Orchestration** | Airflow triggers 45-minute retraining and 2-minute stream health-check DAGs |
 | **Serving** | FastAPI exposes overview, prediction, hotspot, analytics, system, model, and pipeline endpoints |
 | **Dashboard** | Next.js interactive map with 3 modes (Replay ●, Live ▲, Full ●▲), heatmaps, and analytical charts |
 | **Monitoring** | Prometheus + Grafana collect runtime metrics; Blackbox Exporter probes service endpoints |
@@ -460,27 +460,42 @@ Startup logs are written to `/var/log/traffic/node*-bootstrap.log` on each VM.
 
 ### Progressive Retraining Strategy
 
-The system uses a **progressive retraining** approach: Airflow checks every 20 minutes, but Node 3 only retrains when the Silver feature snapshot has changed. This deliberately removes the old `RETRAIN_MIN_US_ROWS=3,000,000` gate; the correct trigger is **new Silver data**, not a fixed replay row count.
+The system uses a **progressive retraining** approach: Airflow checks every 45 minutes, but Node 3 only retrains when the Silver feature snapshot has changed. This deliberately removes the old `RETRAIN_MIN_US_ROWS=3,000,000` gate; the correct trigger is **new Silver data**, not a fixed replay row count.
 
 - **Silver freshness gate**: Node 3 builds a deterministic GCS object manifest for `SILVER_FEATURES_PATH`. If it matches the last successful manifest, the run exits cleanly without Spark/H2O work.
 - **Successful watermark**: The Silver manifest is recorded only after Spark writes Gold data and H2O AutoML finishes successfully. A failed retrain does not advance the watermark.
 - **Cumulative training set**: Every successful Spark run writes Gold features that include **old + new replay data**. Retraining is therefore cumulative, not "new data only" training.
 - **No forced reset on scheduled ticks**: the Airflow DAG must not wipe local Silver/Gold snapshots on every schedule tick. Forced reset is reserved for manual recovery or full replay reset operations only.
+- **Batch completeness contract**: one successful retrain batch means **one parent MLflow run + the full top-k leaderboard set** (`top1 ... top10` by default). A partial parent run is treated as incomplete and must not count toward the finished loop.
+- **Container-safe local snapshots**: Node 3 writes Gold data through Spark containers mounted onto `/opt/traffic/data`. The host snapshot directories therefore need container-writable permissions before Spark starts, otherwise `_temporary/.../event_year=*` writes fail on the bind mount.
 - **Model metrics contract**: Each retrain logs top model runs plus the registered best model metrics (`accuracy`, `weighted_f1`, `weighted_recall`, `weighted_precision`) to MLflow so the dashboard does not show a finished retrain with missing core metrics.
 - **MLflow run contract**: each scheduled retrain logs one parent run (`h2o_retrain_online`) and up to top-10 nested leaderboard runs (`retrain_top1_*` ... `retrain_top10_*`) with a shared `retrain_batch_id`.
 - `RETRAIN_MIN_US_ROWS`: **Set to 0 by default** (gate disabled). The row-count threshold proved to be an anti-pattern — during replay, data streams in continuously, so checking for *new* Silver objects is more accurate than checking for a minimum row count. If you want to re-enable, set to a positive integer in `.env.cloud`.
 - `RETRAIN_ALLOW_IF_COUNT_UNAVAILABLE`: set to `true` to continue retrain even if the row-count API is unreachable.
 
+**Recommended Node 3 retrain profile (`/opt/traffic/.env.cloud`):**
+- `NODE3_H2O_MAX_RUNTIME=900` keeps one retrain tick comfortably inside the 45-minute Airflow cadence, and Node 3 now ignores the generic `H2O_MAX_RUNTIME` setting so a local/offline value cannot silently stretch cloud retrains back to one hour.
+- `NODE3_H2O_MAX_MEM=4G` is the practical upper bound on the current batch VM; higher heap values risk host-level OOM kills.
+- `H2O_TRAIN_MAX_ROWS=500000` bounds the active training frame size while preserving the cumulative Gold snapshot on disk.
+- `H2O_BALANCE_CLASSES=false` avoids duplicating rows in-memory on the small VM; class imbalance is still visible in metrics, but the retrain loop remains stable.
+- `H2O_MAX_RUNTIME_SECS_PER_MODEL=90`, `H2O_NFOLDS=0`, and `H2O_EXCLUDE_ALGOS=DeepLearning,StackedEnsemble,XGBoost` keep AutoML focused on CPU-friendly models that can reliably produce a full top-10 leaderboard.
+
+**Troubleshooting the cloud retrain loop:**
+- If Spark fails writing `incremental_batches/<batch_id>`, make sure `run-node3.sh` recreates the local Gold directories with container-writable permissions before `spark-submit`.
+- If the latest parent MLflow run stays `RUNNING` after the process died, restart Node 3 with a clean lock/PID state and validate the next parent run rather than counting the stale run.
+- If H2O logs `Unblock allocations ... OOM`, lower `H2O_TRAIN_MAX_ROWS` first before increasing heap; the VM runs more reliably with a smaller sampled frame than with a larger JVM. The cloud default is now `500000` rows for that reason.
+- After any batch-side change, rerun `scripts/gcp/run-node3.sh`, then verify `/api/v1/model/retrain-history` and `/api/v1/pipeline/replay-health` before trusting the dashboard.
+
 **How it works:**
 1. Node 2 streams US post-2020 data through Kafka → Flink → PostgreSQL `traffic_risk_predictions` + Silver JSONL to GCS
-2. Airflow DAG `model_retrain_hourly` triggers every 20 minutes (`*/20 * * * *`)
+2. Airflow DAG `model_retrain_hourly` triggers every 45 minutes (`*/45 * * * *`)
 3. Node 3 acquires a mutex lock, then compares the current Silver manifest with the last successful manifest
-4. If new Silver files exist → Spark Silver→Gold → H2O AutoML training → MLflow Model Registry update
+4. If new Silver files exist → Spark Silver→Gold → H2O AutoML training → full top-k MLflow logging → Model Registry update
 5. If no new Silver files → exits cleanly (no wasted compute)
 6. Flink auto-loads `traffic-risk-model/latest` on each checkpoint cycle
 7. Model quality improves as more post-2020 replay data accumulates
 
-The dashboard pipeline page reports `Retrain loop: CONTINUE / FINISHED / FAILED`, source row counts, and the `new_silver_data_only` policy.
+The dashboard pipeline page reports `Retrain loop: CONTINUE / FINISHED / FAILED`, source row counts, retrain batch completeness, and the `new_silver_data_only` policy.
 
 - `CONTINUE`: new replay or live data is still arriving, or the system has not yet completed the minimum successful retrain batches.
 - `FINISHED`: all tracked streams are idle for multiple schedule windows and at least the minimum successful retrain batches have completed.

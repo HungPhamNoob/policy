@@ -88,6 +88,57 @@ def test_latency_handles_missing_latency_columns(monkeypatch):
     assert result["columns"] == []
 
 
+def test_latency_returns_source_breakdown(monkeypatch):
+    monkeypatch.setattr(
+        pipeline_service, "_prediction_table_names", lambda: ["traffic_risk_predictions"]
+    )
+    monkeypatch.setattr(
+        pipeline_service,
+        "_columns_for_table",
+        lambda table_name: {"processed_time", "inference_latency_ms", "end_to_end_latency_ms"},
+    )
+    monkeypatch.setattr(
+        pipeline_service,
+        "_skip_expensive_time_scan",
+        lambda table_name, column: False,
+    )
+    monkeypatch.setattr(
+        pipeline_service,
+        "_latest_table_timestamp",
+        lambda table_name, column: datetime(2024, 1, 1, tzinfo=timezone.utc),
+    )
+    rows = iter(
+        [
+            {
+                "p50": 100.0,
+                "p95": 200.0,
+                "p99": 250.0,
+                "avg": 150.0,
+                "sample_count": 4,
+            },
+            {
+                "p50": 100.0,
+                "p95": 200.0,
+                "p99": 250.0,
+                "avg": 150.0,
+                "sample_count": 4,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        pipeline_service,
+        "fetch_one",
+        lambda *args, **kwargs: next(rows),
+    )
+
+    result = pipeline_service.latency("p95")
+
+    assert result["status"] == "stale"
+    assert result["columns"]["traffic_risk_predictions"]["selected_latency_column"] == "inference_latency_ms"
+    assert result["sources"]["traffic_risk_predictions"]["latency_column"] == "inference_latency_ms"
+    assert result["sources"]["traffic_risk_predictions"]["p95"] == 200.0
+
+
 def test_throughput_uses_latest_active_window_when_stream_is_stale(monkeypatch):
     monkeypatch.setattr(
         pipeline_service, "_prediction_table_names", lambda: ["traffic_risk_predictions"]
@@ -196,6 +247,8 @@ def test_retrain_loop_counts_finished_root_runs_from_param(monkeypatch):
                             "params.run_type": "retrain_online",
                             "tags.run_role": "retrain_parent",
                             "status": "FINISHED",
+                            "params.top_k_models": "10",
+                            "metrics.models_logged": 10.0,
                         },
                         {
                             "tags.mlflow.runName": "retrain_top1_xgboost",
@@ -231,6 +284,63 @@ def test_retrain_loop_counts_finished_root_runs_from_param(monkeypatch):
     assert result["status"] == "continue"
     assert result["recent_retrain_runs"] == 1
     assert result["recent_retrain_finished"] == 1
+    assert result["schedule_interval_minutes"] == 20
+    assert result["schedule_window_minutes"] == 20
+    assert result["idle_window_minutes"] == 60
+
+
+def test_retrain_loop_marks_incomplete_latest_parent_as_failed(monkeypatch):
+    pipeline_service._RETRAIN_LOOP_CACHE = {}
+    pipeline_service._RETRAIN_LOOP_CACHE_TS = 0.0
+
+    class FakeMlflow:
+        @staticmethod
+        def set_tracking_uri(uri):
+            return None
+
+        @staticmethod
+        def get_experiment_by_name(name):
+            return type("Experiment", (), {"experiment_id": "1"})()
+
+        @staticmethod
+        def search_runs(experiment_ids, max_results, order_by):
+            class FakeDataFrame:
+                def iterrows(self):
+                    rows = [
+                        {
+                            "tags.mlflow.runName": "h2o_retrain_online",
+                            "params.run_type": "retrain_online",
+                            "tags.run_role": "retrain_parent",
+                            "status": "FINISHED",
+                            "params.top_k_models": "10",
+                            "metrics.models_logged": 2.0,
+                        }
+                    ]
+                    for idx, row in enumerate(rows):
+                        yield idx, row
+
+            return FakeDataFrame()
+
+    monkeypatch.setitem(sys.modules, "mlflow", FakeMlflow)
+
+    settings = pipeline_service.get_settings()
+    source_health = [
+        {
+            "table": "traffic_risk_predictions",
+            "latest_event_time": datetime.now(timezone.utc).isoformat(),
+        }
+    ]
+
+    result = pipeline_service._compute_retrain_loop_status(
+        source_health,
+        replay_rows=100,
+        settings=settings,
+    )
+
+    assert result["status"] == "failed"
+    assert result["recent_retrain_runs"] == 1
+    assert result["recent_retrain_finished"] == 0
+    assert result["latest_retrain_incomplete"] is True
 
 
 def test_retrain_history_filters_non_retrain_runs(monkeypatch):
@@ -253,7 +363,7 @@ def test_retrain_history_filters_non_retrain_runs(monkeypatch):
 
             class FakeDataFrame:
                 def __len__(self):
-                    return 3
+                    return 4
 
                 def iterrows(self):
                     rows = [
@@ -266,14 +376,34 @@ def test_retrain_history_filters_non_retrain_runs(monkeypatch):
                             "start_time": FakeTimestamp(),
                             "end_time": FakeTimestamp(),
                             "metrics.accuracy": 0.9,
+                            "params.top_k_models": "10",
+                            "metrics.models_logged": 10.0,
                         },
                         {
                             "run_id": "child-1",
                             "tags.mlflow.runName": "retrain_top1_xgboost",
+                            "tags.mlflow.parentRunId": "parent-1",
+                            "tags.run_role": "leaderboard_model",
                             "status": "FINISHED",
+                            "params.rank": "1",
+                            "params.model_id": "XGBoost_1_AutoML_1",
+                            "params.algo": "xgboost",
                             "start_time": FakeTimestamp(),
                             "end_time": FakeTimestamp(),
                             "metrics.weighted_f1": 0.8,
+                        },
+                        {
+                            "run_id": "child-2",
+                            "tags.mlflow.runName": "retrain_top6_glm",
+                            "tags.mlflow.parentRunId": "parent-1",
+                            "tags.run_role": "leaderboard_model",
+                            "status": "FINISHED",
+                            "params.rank": "6",
+                            "params.model_id": "GLM_1_AutoML_1",
+                            "params.algo": "glm",
+                            "start_time": FakeTimestamp(),
+                            "end_time": FakeTimestamp(),
+                            "metrics.weighted_f1": 0.5,
                         },
                         {
                             "run_id": "bootstrap-1",
@@ -293,8 +423,19 @@ def test_retrain_history_filters_non_retrain_runs(monkeypatch):
     result = model_service.retrain_history(limit=10)
 
     assert result["status"] == "ok"
-    assert [run["run_id"] for run in result["runs"][:2]] == ["parent-1", "child-1"]
+    assert [run["run_id"] for run in result["runs"][:1]] == ["parent-1"]
     assert all(run["run_id"] != "bootstrap-1" for run in result["runs"])
+    assert all(run["run_id"] != "child-1" for run in result["runs"])
+    assert result["runs"][0]["expected_models"] == 10
+    assert result["runs"][0]["models_logged"] == 10
+    assert result["runs"][0]["is_complete_batch"] is True
+    assert [child["run_name"] for child in result["runs"][0]["leaderboard_models"]] == [
+        "retrain_top1_xgboost",
+        "retrain_top6_glm",
+    ]
+    assert result["runs"][0]["leaderboard_models"][1]["rank"] == 6
+    assert result["runs"][0]["leaderboard_models"][1]["model_id"] == "GLM_1_AutoML_1"
+    assert result["runs"][0]["leaderboard_models"][1]["algo"] == "glm"
 
 
 def test_full_map_uses_limit_per_source(monkeypatch):
