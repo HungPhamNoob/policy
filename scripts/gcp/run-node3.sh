@@ -28,6 +28,9 @@ APT_CACHE_UPDATED=0
 NODE3_TEMP_DIR="$(mktemp -d /tmp/node3-run-XXXXXX)"
 NODE3_SILVER_LS_STDOUT="${NODE3_TEMP_DIR}/silver-ls.txt"
 NODE3_SILVER_LS_STDERR="${NODE3_TEMP_DIR}/silver-ls.err"
+NODE3_REMOTE_MANIFEST_LS_STDOUT="${NODE3_TEMP_DIR}/silver-manifests-ls.txt"
+NODE3_REMOTE_MANIFEST_LS_STDERR="${NODE3_TEMP_DIR}/silver-manifests-ls.err"
+NODE3_REMOTE_PENDING_MANIFESTS="${NODE3_STATE_DIR}/current-remote-silver-manifests.txt"
 NODE3_CURRENT_SILVER_DELTA_MANIFEST="${NODE3_STATE_DIR}/current-silver-delta-manifest.txt"
 NODE3_CURRENT_SILVER_WATERMARK_FILE="${NODE3_STATE_DIR}/current-silver-watermark.txt"
 NODE3_LAST_SUCCESSFUL_SILVER_WATERMARK_FILE="${NODE3_STATE_DIR}/last-successful-silver-watermark.txt"
@@ -37,6 +40,8 @@ NODE3_STOP_SPARK_FOR_H2O="${NODE3_STOP_SPARK_FOR_H2O:-true}"
 NODE3_LOCAL_PENDING_DELTA_COUNT=0
 NODE3_LOCAL_PENDING_TOTAL_COUNT=0
 NODE3_CURRENT_BATCH_ID=""
+NODE3_REMOTE_PENDING_MANIFEST_COUNT=0
+NODE3_INCREMENTAL_BATCH_LIMIT="${NODE3_DELTA_BATCH_MAX_FILES:-${SPARK_INCREMENTAL_MAX_FILES:-10000}}"
 
 ensure_path_writable() {
   local target_path="$1"
@@ -319,7 +324,7 @@ build_local_silver_delta_manifest() {
     "${NODE3_CURRENT_SILVER_WATERMARK_FILE}" \
     "${NODE3_LAST_SUCCESSFUL_SILVER_WATERMARK_FILE}" \
     "${NODE3_CURRENT_SILVER_PENDING_TOTAL_FILE}" \
-    "${NODE3_DELTA_BATCH_MAX_FILES:-${SPARK_INCREMENTAL_MAX_FILES:-15000}}" <<'PY'; then
+    "${NODE3_INCREMENTAL_BATCH_LIMIT}" <<'PY'; then
 import sys
 import re
 from pathlib import Path
@@ -458,11 +463,132 @@ bootstrap_local_gold_snapshot() {
 }
 
 sync_silver_snapshot() {
-  echo "Running an incremental Silver rsync from GCS into the local snapshot."
+  local manifest_root="${SILVER_MANIFESTS_PATH:-${SILVER_FEATURES_PATH%/}/runs/live/manifests}"
+  local batch_limit="${NODE3_INCREMENTAL_BATCH_LIMIT}"
 
-  if ! gcloud storage rsync -r "${SILVER_FEATURES_PATH}" "${LOCAL_SILVER_FEATURES_PATH}"; then
-    echo "WARNING: Silver rsync reported transient copy errors while streaming was active."
-    echo "WARNING: Continuing with the files that were copied into the local snapshot."
+  ensure_path_writable "${NODE3_STATE_DIR}"
+  : > "${NODE3_REMOTE_PENDING_MANIFESTS}"
+
+  echo "Looking for Silver manifests newer than the last successful retrain watermark."
+  echo "Manifest root: ${manifest_root}"
+
+  if ! timeout "${NODE3_GCLOUD_STORAGE_TIMEOUT_SECONDS}" \
+    gcloud storage ls "${manifest_root%/}/manifest-*.json" \
+    >"${NODE3_REMOTE_MANIFEST_LS_STDOUT}" 2>"${NODE3_REMOTE_MANIFEST_LS_STDERR}"; then
+    local manifest_ls_exit_code=$?
+    if [ "${manifest_ls_exit_code}" -eq 124 ]; then
+      echo "Manifest listing timed out after ${NODE3_GCLOUD_STORAGE_TIMEOUT_SECONDS}s. Falling back to full Silver rsync."
+    else
+      echo "Manifest listing failed with exit code ${manifest_ls_exit_code}. Falling back to full Silver rsync."
+    fi
+    if [ -s "${NODE3_REMOTE_MANIFEST_LS_STDERR}" ]; then
+      cat "${NODE3_REMOTE_MANIFEST_LS_STDERR}"
+    fi
+    if ! gcloud storage rsync -r "${SILVER_FEATURES_PATH}" "${LOCAL_SILVER_FEATURES_PATH}"; then
+      echo "WARNING: Silver rsync reported transient copy errors while streaming was active."
+      echo "WARNING: Continuing with the files that were copied into the local snapshot."
+    fi
+    return 0
+  fi
+
+  if ! python3 - \
+    "${NODE3_REMOTE_MANIFEST_LS_STDOUT}" \
+    "${NODE3_LAST_SUCCESSFUL_SILVER_WATERMARK_FILE}" \
+    "${NODE3_REMOTE_PENDING_MANIFESTS}" \
+    "${batch_limit}" <<'PY'; then
+import re
+import sys
+from pathlib import Path
+
+manifest_list_path = Path(sys.argv[1])
+watermark_path = Path(sys.argv[2])
+output_path = Path(sys.argv[3])
+batch_limit = int(sys.argv[4])
+
+last_watermark = ""
+if watermark_path.exists():
+    last_watermark = watermark_path.read_text(encoding="utf-8").strip()
+
+pattern = re.compile(r"manifest-(\d{8}T\d+Z)\.json$")
+entries = []
+for line in manifest_list_path.read_text(encoding="utf-8").splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    match = pattern.search(line)
+    if not match:
+        continue
+    stamp = match.group(1)
+    if last_watermark and stamp <= last_watermark:
+        continue
+    entries.append((stamp, line))
+
+entries.sort()
+selected = entries[:batch_limit] if batch_limit > 0 else entries
+output_path.write_text(
+    "\n".join(path for _, path in selected) + ("\n" if selected else ""),
+    encoding="utf-8",
+)
+print(len(entries))
+PY
+    echo "WARNING: Failed to build incremental Silver manifest list. Falling back to full Silver rsync."
+    if ! gcloud storage rsync -r "${SILVER_FEATURES_PATH}" "${LOCAL_SILVER_FEATURES_PATH}"; then
+      echo "WARNING: Silver rsync reported transient copy errors while streaming was active."
+      echo "WARNING: Continuing with the files that were copied into the local snapshot."
+    fi
+    return 0
+  fi
+
+  NODE3_REMOTE_PENDING_MANIFEST_COUNT="$(wc -l < "${NODE3_REMOTE_PENDING_MANIFESTS}" | tr -d ' ')"
+  echo "Detected ${NODE3_REMOTE_PENDING_MANIFEST_COUNT} new Silver manifests ready for this retrain tick."
+  if [ "${NODE3_REMOTE_PENDING_MANIFEST_COUNT}" -eq 0 ]; then
+    echo "No remote Silver manifests are newer than the last successful watermark."
+    return 0
+  fi
+
+  if ! python3 - \
+    "${NODE3_REMOTE_PENDING_MANIFESTS}" \
+    "${SILVER_FEATURES_PATH}" \
+    "${LOCAL_SILVER_FEATURES_PATH}" <<'PY'; then
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+manifest_paths = [
+    line.strip()
+    for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+silver_root = sys.argv[2].rstrip("/")
+local_root = Path(sys.argv[3])
+
+for manifest_path in manifest_paths:
+    raw = subprocess.check_output(
+        ["gcloud", "storage", "cat", manifest_path],
+        text=True,
+    )
+    payload = json.loads(raw)
+    silver_path = str(payload.get("silver_path") or "").strip()
+    if not silver_path.startswith(silver_root + "/"):
+        raise SystemExit(
+            f"Manifest silver_path is outside SILVER_FEATURES_PATH: {silver_path}"
+        )
+    relative_path = silver_path[len(silver_root) + 1 :]
+    destination = local_root / relative_path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.check_call(
+        ["gcloud", "storage", "cp", silver_path, str(destination)],
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+    )
+PY
+    echo "WARNING: Incremental Silver manifest copy failed. Falling back to full Silver rsync."
+    if ! gcloud storage rsync -r "${SILVER_FEATURES_PATH}" "${LOCAL_SILVER_FEATURES_PATH}"; then
+      echo "WARNING: Silver rsync reported transient copy errors while streaming was active."
+      echo "WARNING: Continuing with the files that were copied into the local snapshot."
+    fi
   fi
 }
 

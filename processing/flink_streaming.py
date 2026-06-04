@@ -446,6 +446,10 @@ def initialize_schemas() -> None:
 _GCS_FS = None
 _SILVER_BATCH_BUFFERS: Dict[str, List[Dict[str, Any]]] = {}
 _SILVER_BATCH_STARTED_AT: Dict[str, float] = {}
+SILVER_MANIFESTS_PATH = os.getenv(
+    "SILVER_MANIFESTS_PATH",
+    f"{SILVER_FEATURES_PATH.rstrip('/')}/runs/live/manifests",
+)
 
 
 def _buffer_age_ms(started_at: Optional[float]) -> float:
@@ -484,12 +488,26 @@ def flush_silver_prefix(prefix: str) -> None:
         f"{SILVER_FEATURES_PATH.rstrip('/')}/{prefix}/batches/"
         f"features-{timestamp}.jsonl"
     )
+    manifest_path = (
+        f"{SILVER_MANIFESTS_PATH.rstrip('/')}/manifest-{timestamp}.json"
+    )
     payload = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n"
 
     try:
         fs = _get_gcs_fs()
         with fs.open(path, "wb") as file_obj:
             file_obj.write(payload.encode("utf-8"))
+        manifest_payload = json.dumps(
+            {
+                "timestamp": timestamp,
+                "silver_path": path,
+                "prefix": prefix,
+                "row_count": len(rows),
+            },
+            ensure_ascii=False,
+        )
+        with fs.open(manifest_path, "wb") as file_obj:
+            file_obj.write(manifest_payload.encode("utf-8"))
         logger.info("Flushed %d Silver features to %s", len(rows), path)
         _SILVER_BATCH_BUFFERS[prefix] = []
         _SILVER_BATCH_STARTED_AT.pop(prefix, None)
