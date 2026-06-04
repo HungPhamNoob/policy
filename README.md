@@ -119,7 +119,7 @@ This repository implements the **complete end-to-end data and ML pipeline**:
 │    → Silver JSONL + PostgreSQL traffic_risk_predictions             │
 │    → Spark batch cleaning / dedup / partitioning                   │
 │    → Gold Parquet + CSV                                            │
-│    → H2O AutoML retraining (15-minute Airflow schedule)            │
+│    → H2O AutoML retraining (20-minute Airflow schedule)            │
 │    → MLflow Model Registry (updated)                               │
 └─────────────────────────────────────────────────────────────────────┘
 
@@ -460,24 +460,45 @@ Startup logs are written to `/var/log/traffic/node*-bootstrap.log` on each VM.
 
 ### Progressive Retraining Strategy
 
-The system uses a **progressive retraining** approach: Airflow checks every 15 minutes, but Node 3 only retrains when the Silver feature snapshot has changed. This deliberately removes the old `RETRAIN_MIN_US_ROWS=3,000,000` gate; the correct trigger is **new Silver data**, not a fixed replay row count.
+The system uses a **progressive retraining** approach: Airflow checks every 20 minutes, but Node 3 only retrains when the Silver feature snapshot has changed. This deliberately removes the old `RETRAIN_MIN_US_ROWS=3,000,000` gate; the correct trigger is **new Silver data**, not a fixed replay row count.
 
 - **Silver freshness gate**: Node 3 builds a deterministic GCS object manifest for `SILVER_FEATURES_PATH`. If it matches the last successful manifest, the run exits cleanly without Spark/H2O work.
 - **Successful watermark**: The Silver manifest is recorded only after Spark writes Gold data and H2O AutoML finishes successfully. A failed retrain does not advance the watermark.
+- **Cumulative training set**: Every successful Spark run writes Gold features that include **old + new replay data**. Retraining is therefore cumulative, not "new data only" training.
+- **No forced reset on scheduled ticks**: the Airflow DAG must not wipe local Silver/Gold snapshots on every schedule tick. Forced reset is reserved for manual recovery or full replay reset operations only.
 - **Model metrics contract**: Each retrain logs top model runs plus the registered best model metrics (`accuracy`, `weighted_f1`, `weighted_recall`, `weighted_precision`) to MLflow so the dashboard does not show a finished retrain with missing core metrics.
+- **MLflow run contract**: each scheduled retrain logs one parent run (`h2o_retrain_online`) and up to top-10 nested leaderboard runs (`retrain_top1_*` ... `retrain_top10_*`) with a shared `retrain_batch_id`.
 - `RETRAIN_MIN_US_ROWS`: **Set to 0 by default** (gate disabled). The row-count threshold proved to be an anti-pattern — during replay, data streams in continuously, so checking for *new* Silver objects is more accurate than checking for a minimum row count. If you want to re-enable, set to a positive integer in `.env.cloud`.
 - `RETRAIN_ALLOW_IF_COUNT_UNAVAILABLE`: set to `true` to continue retrain even if the row-count API is unreachable.
 
 **How it works:**
 1. Node 2 streams US post-2020 data through Kafka → Flink → PostgreSQL `traffic_risk_predictions` + Silver JSONL to GCS
-2. Airflow DAG `model_retrain_hourly` triggers every 15 minutes (`*/15 * * * *`)
+2. Airflow DAG `model_retrain_hourly` triggers every 20 minutes (`*/20 * * * *`)
 3. Node 3 acquires a mutex lock, then compares the current Silver manifest with the last successful manifest
 4. If new Silver files exist → Spark Silver→Gold → H2O AutoML training → MLflow Model Registry update
 5. If no new Silver files → exits cleanly (no wasted compute)
 6. Flink auto-loads `traffic-risk-model/latest` on each checkpoint cycle
 7. Model quality improves as more post-2020 replay data accumulates
 
-The dashboard pipeline page reports `Retrain loop: Running/Finished/Failed`, source row counts, and the `new_silver_data_only` policy. The retrain loop auto-recovers on the next Airflow schedule if any transient failure occurs (network timeout, OOM, lock contention).
+The dashboard pipeline page reports `Retrain loop: CONTINUE / FINISHED / FAILED`, source row counts, and the `new_silver_data_only` policy.
+
+- `CONTINUE`: new replay or live data is still arriving, or the system has not yet completed the minimum successful retrain batches.
+- `FINISHED`: all tracked streams are idle for multiple schedule windows and at least the minimum successful retrain batches have completed.
+- `FAILED`: the latest root retrain batch failed and no newer successful root retrain batch has replaced it yet.
+
+The retrain loop auto-recovers on the next Airflow schedule if any transient failure occurs (network timeout, OOM, lock contention).
+
+### Updating Cloud Nodes Without CI/CD
+
+This project can be updated directly on the running VMs without a CI/CD pipeline.
+
+1. Sync code to the target VM (`node1-control`, `node2-streaming`, `node3-batch`) with `gcloud compute scp` or `git pull`.
+2. Keep `/opt/traffic/.env.cloud` as the runtime source of truth.
+3. Rebuild only the affected service instead of restarting the whole cluster:
+   - `node1-control`: rebuild `fastapi` when backend code changes; restart `airflow` and `airflow-scheduler` when DAG files change.
+   - `node2-streaming`: rerun `scripts/gcp/run-node2.sh` only when streaming code or compose config changes.
+   - `node3-batch`: rerun `scripts/gcp/run-node3.sh` for manual retrain validation after batch-side code changes.
+4. Verify the dashboard, MLflow, and Airflow after every update before sharing the build with the team.
 
 ---
 
@@ -510,6 +531,8 @@ The Next.js dashboard provides three viewing modes:
 | **Replay** | ● | US post-2020 accidents | Historical replay data with H2O model inference |
 | **Live** | ▲ | TomTom real-time incidents | Live traffic incidents with rule-based severity |
 | **Full** | ●▲ | Replay + Live | Strict sum of US replay rows and TomTom live incidents |
+
+`full` must always equal `replay + live`. The backend therefore queries both serving tables and merges the results instead of treating `full` as a separate stored dataset.
 
 ### Dashboard Components
 

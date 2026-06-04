@@ -153,6 +153,16 @@ def test_replay_health_returns_exact_replay_count_and_threshold(monkeypatch):
 
     settings = pipeline_service.get_settings()
     monkeypatch.setattr(settings, "retrain_min_us_rows", 3_000_000)
+    monkeypatch.setattr(
+        pipeline_service,
+        "_compute_retrain_loop_status",
+        lambda source_health, replay_rows, settings: {
+            "status": "continue",
+            "reason": "test stub",
+            "recent_retrain_runs": 0,
+            "recent_retrain_finished": 0,
+        },
+    )
 
     result = pipeline_service.replay_health()
 
@@ -161,6 +171,130 @@ def test_replay_health_returns_exact_replay_count_and_threshold(monkeypatch):
     assert result["retrain_ready"] is False
     assert result["sources"][0]["row_count"] == 2_175_600
     assert result["sources"][1]["row_count"] == 8_948
+
+
+def test_retrain_loop_counts_finished_root_runs_from_param(monkeypatch):
+    pipeline_service._RETRAIN_LOOP_CACHE = {}
+    pipeline_service._RETRAIN_LOOP_CACHE_TS = 0.0
+
+    class FakeMlflow:
+        @staticmethod
+        def set_tracking_uri(uri):
+            return None
+
+        @staticmethod
+        def get_experiment_by_name(name):
+            return type("Experiment", (), {"experiment_id": "1"})()
+
+        @staticmethod
+        def search_runs(experiment_ids, max_results, order_by):
+            class FakeDataFrame:
+                def iterrows(self):
+                    rows = [
+                        {
+                            "tags.mlflow.runName": "h2o_retrain_online",
+                            "params.run_type": "retrain_online",
+                            "tags.run_role": "retrain_parent",
+                            "status": "FINISHED",
+                        },
+                        {
+                            "tags.mlflow.runName": "retrain_top1_xgboost",
+                            "tags.mlflow.parentRunId": "abc",
+                            "status": "FINISHED",
+                        },
+                    ]
+                    for idx, row in enumerate(rows):
+                        yield idx, row
+
+            return FakeDataFrame()
+
+    monkeypatch.setitem(sys.modules, "mlflow", FakeMlflow)
+
+    settings = pipeline_service.get_settings()
+    source_health = [
+        {
+            "table": "traffic_risk_predictions",
+            "latest_event_time": datetime.now(timezone.utc).isoformat(),
+        },
+        {
+            "table": "traffic_tomtom_incidents",
+            "latest_event_time": datetime.now(timezone.utc).isoformat(),
+        },
+    ]
+
+    result = pipeline_service._compute_retrain_loop_status(
+        source_health,
+        replay_rows=100,
+        settings=settings,
+    )
+
+    assert result["status"] == "continue"
+    assert result["recent_retrain_runs"] == 1
+    assert result["recent_retrain_finished"] == 1
+
+
+def test_retrain_history_filters_non_retrain_runs(monkeypatch):
+    from app.services import model_service
+
+    class FakeMlflow:
+        @staticmethod
+        def set_tracking_uri(uri):
+            return None
+
+        @staticmethod
+        def get_experiment_by_name(name):
+            return type("Experiment", (), {"experiment_id": "1"})()
+
+        @staticmethod
+        def search_runs(experiment_ids, max_results, order_by):
+            class FakeTimestamp:
+                def isoformat(self):
+                    return "2026-06-04T00:00:00+00:00"
+
+            class FakeDataFrame:
+                def __len__(self):
+                    return 3
+
+                def iterrows(self):
+                    rows = [
+                        {
+                            "run_id": "parent-1",
+                            "tags.mlflow.runName": "h2o_retrain_online",
+                            "tags.run_type": "retrain_online",
+                            "tags.run_role": "retrain_parent",
+                            "status": "FINISHED",
+                            "start_time": FakeTimestamp(),
+                            "end_time": FakeTimestamp(),
+                            "metrics.accuracy": 0.9,
+                        },
+                        {
+                            "run_id": "child-1",
+                            "tags.mlflow.runName": "retrain_top1_xgboost",
+                            "status": "FINISHED",
+                            "start_time": FakeTimestamp(),
+                            "end_time": FakeTimestamp(),
+                            "metrics.weighted_f1": 0.8,
+                        },
+                        {
+                            "run_id": "bootstrap-1",
+                            "tags.mlflow.runName": "bootstrap_heuristic_serving",
+                            "status": "FINISHED",
+                            "start_time": FakeTimestamp(),
+                            "end_time": FakeTimestamp(),
+                        },
+                    ]
+                    for idx, row in enumerate(rows):
+                        yield idx, row
+
+            return FakeDataFrame()
+
+    monkeypatch.setitem(sys.modules, "mlflow", FakeMlflow)
+
+    result = model_service.retrain_history(limit=10)
+
+    assert result["status"] == "ok"
+    assert [run["run_id"] for run in result["runs"][:2]] == ["parent-1", "child-1"]
+    assert all(run["run_id"] != "bootstrap-1" for run in result["runs"])
 
 
 def test_full_map_uses_limit_per_source(monkeypatch):

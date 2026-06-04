@@ -77,6 +77,9 @@ H2O_MAX_MEM = os.getenv("H2O_MAX_MEM", "2G")
 H2O_NTHREADS = int(os.getenv("H2O_NTHREADS", "2"))
 H2O_IP = os.getenv("H2O_IP", "127.0.0.1")
 H2O_PORT = int(os.getenv("H2O_PORT", "54321"))
+TOP_K_MODELS = max(1, int(os.getenv("H2O_TOP_K_MODELS", "10")))
+H2O_MAX_MODELS = max(TOP_K_MODELS, int(os.getenv("H2O_MAX_MODELS", str(TOP_K_MODELS))))
+RETRAIN_BATCH_ID = os.getenv("RETRAIN_BATCH_ID", os.getenv("SPARK_BATCH_ID", "")).strip()
 USE_CLASS_SAMPLING_FACTORS = (
     os.getenv("H2O_USE_CLASS_SAMPLING_FACTORS", "true").lower() == "true"
 )
@@ -406,9 +409,12 @@ def main():
     logger.info("MLflow experiment:       %s", MLFLOW_EXPERIMENT_NAME)
     logger.info("Registered model name:   %s", MODEL_NAME)
     logger.info("Max runtime (seconds):   %s", MAX_RUNTIME_SECS)
+    logger.info("Max models:              %s", H2O_MAX_MODELS)
+    logger.info("Top models to log:       %s", TOP_K_MODELS)
     logger.info("H2O max memory:          %s", H2O_MAX_MEM)
     logger.info("H2O threads:             %s", H2O_NTHREADS)
     logger.info("Random seed:             %s", SEED)
+    logger.info("Retrain batch ID:        %s", RETRAIN_BATCH_ID or "(not provided)")
 
     # ---- Step 1: Initialize H2O cluster ----
     logger.info("Step 1: Initializing H2O cluster...")
@@ -464,13 +470,21 @@ def main():
         run_id = run.info.run_id
         logger.info("MLflow run ID: %s", run_id)
 
+        mlflow.set_tag("run_type", "retrain_online")
+        mlflow.set_tag("run_role", "retrain_parent")
+        if RETRAIN_BATCH_ID:
+            mlflow.set_tag("retrain_batch_id", RETRAIN_BATCH_ID)
         mlflow.log_param("run_type", "retrain_online")
+        mlflow.log_param("top_k_models", TOP_K_MODELS)
+        mlflow.log_param("max_models", H2O_MAX_MODELS)
         mlflow.log_param("max_runtime_secs", MAX_RUNTIME_SECS)
         mlflow.log_param("seed", SEED)
         mlflow.log_param("n_features", len(feature_columns))
         mlflow.log_param("n_train_rows", train.nrows)
         mlflow.log_param("n_test_rows", test.nrows)
         mlflow.log_param("data_path", data_path)
+        if RETRAIN_BATCH_ID:
+            mlflow.log_param("retrain_batch_id", RETRAIN_BATCH_ID)
         if class_sampling_factors:
             mlflow.log_param(
                 "class_sampling_labels",
@@ -487,6 +501,7 @@ def main():
 
         automl_parameters = {
             "max_runtime_secs": MAX_RUNTIME_SECS,
+            "max_models": H2O_MAX_MODELS,
             "seed": SEED,
             "project_name": "traffic_risk_retrain",
             "balance_classes": True,
@@ -508,13 +523,20 @@ def main():
 
         # ---- Step 7: Leaderboard ----
         lb = aml.leaderboard
-        lb_df = lb.head(rows=10).as_data_frame()
-        logger.info("H2O AutoML leaderboard (top 10):\n%s", lb_df)
+        lb_df = lb.head(rows=TOP_K_MODELS).as_data_frame()
+        logger.info("H2O AutoML leaderboard (top %s):\n%s", TOP_K_MODELS, lb_df)
 
         # ---- Step 8: Evaluate and log top 10 models ----
-        top_model_ids = lb_df["model_id"].tolist()
+        top_model_ids = lb_df["model_id"].tolist()[:TOP_K_MODELS]
         if not top_model_ids:
             raise RuntimeError("H2O AutoML produced no leaderboard models.")
+        if len(top_model_ids) < TOP_K_MODELS:
+            logger.warning(
+                "AutoML returned %s models, fewer than requested top-%s. "
+                "Increase H2O_MAX_RUNTIME or investigate failed algorithms.",
+                len(top_model_ids),
+                TOP_K_MODELS,
+            )
         logger.info(
             "Step 8: Evaluating and logging top %s models...", len(top_model_ids)
         )
@@ -552,9 +574,15 @@ def main():
             with mlflow.start_run(
                 run_name=f"retrain_top{rank}_{model.algo}", nested=True
             ):
+                mlflow.set_tag("run_type", "retrain_online")
+                mlflow.set_tag("run_role", "leaderboard_model")
+                if RETRAIN_BATCH_ID:
+                    mlflow.set_tag("retrain_batch_id", RETRAIN_BATCH_ID)
                 mlflow.log_param("rank", rank)
                 mlflow.log_param("model_id", model_id)
                 mlflow.log_param("algo", model.algo)
+                if RETRAIN_BATCH_ID:
+                    mlflow.log_param("retrain_batch_id", RETRAIN_BATCH_ID)
 
                 log_metric_if_exists(model_perf, "logloss")
                 log_metric_if_exists(model_perf, "mean_per_class_error")

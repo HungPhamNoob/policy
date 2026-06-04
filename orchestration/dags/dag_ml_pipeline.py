@@ -54,7 +54,7 @@ with DAG(
                 -o StrictHostKeyChecking=no \
                 -o ConnectTimeout=60 \
                 "${SSH_USER}@${NODE3_IP}" \
-                "cd /opt/traffic && RETRAIN_MIN_US_ROWS=0 NODE3_RESET_LOCAL_SILVER_SNAPSHOT=true NODE3_RESET_LOCAL_GOLD_SNAPSHOT=true H2O_MAX_RUNTIME=3600 NODE3_LOCK_BUSY_EXIT_CODE=0 bash scripts/gcp/run-node3.sh"
+                "cd /opt/traffic && RETRAIN_MIN_US_ROWS=0 H2O_MAX_RUNTIME=3600 NODE3_LOCK_BUSY_EXIT_CODE=0 bash scripts/gcp/run-node3.sh"
 
             echo "=== [Airflow DAG] Retrain completed at $(date -u) ==="
         """,

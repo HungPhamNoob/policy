@@ -25,6 +25,23 @@ _RETRAIN_LOOP_CACHE_TS: float = 0.0
 _RETRAIN_LOOP_CACHE_TTL_S = 30.0
 
 
+def _is_root_retrain_run(row: Any) -> bool:
+    run_name = str(row.get("tags.mlflow.runName") or "")
+    run_type_tag = str(row.get("tags.run_type") or "")
+    run_type_param = str(row.get("params.run_type") or "")
+    run_role = str(row.get("tags.run_role") or "")
+    parent_id = row.get("tags.mlflow.parentRunId")
+    if run_role == "retrain_parent":
+        return True
+    if parent_id:
+        return False
+    return (
+        run_name == "h2o_retrain_online"
+        or run_type_tag == "retrain_online"
+        or run_type_param == "retrain_online"
+    )
+
+
 def _prediction_table_name() -> str:
     return get_settings().prediction_table.split(".")[-1]
 
@@ -467,16 +484,20 @@ def _compute_retrain_loop_status(
         if experiment is not None:
             runs = mlflow.search_runs(
                 experiment_ids=[experiment.experiment_id],
-                max_results=50,
+                max_results=100,
                 order_by=["start_time DESC"],
             )
-            recent_total_count = len(runs)
+            root_runs = []
             for _, row in runs.iterrows():
+                if not _is_root_retrain_run(row):
+                    continue
+                root_runs.append(row)
                 status = str(row.get("status", "")).upper()
                 if status == "FAILED":
                     recent_failed = True
-                elif status == "FINISHED" and str(row.get("tags.run_type", "")) == "retrain_online":
+                elif status == "FINISHED":
                     recent_finished_count += 1
+            recent_total_count = len(root_runs)
             mlflow_available = True
     except Exception:
         pass

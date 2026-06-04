@@ -38,6 +38,17 @@ NODE3_LOCAL_PENDING_DELTA_COUNT=0
 NODE3_LOCAL_PENDING_TOTAL_COUNT=0
 NODE3_CURRENT_BATCH_ID=""
 
+ensure_path_writable() {
+  local target_path="$1"
+  if [ -z "${target_path}" ]; then
+    return 0
+  fi
+
+  sudo mkdir -p "${target_path}"
+  sudo chown -R "$(id -u):$(id -g)" "${target_path}"
+  sudo chmod -R u+rwX,g+rwX "${target_path}"
+}
+
 cleanup_node3_temp() {
   rm -rf "${NODE3_TEMP_DIR}" 2>/dev/null || true
 }
@@ -296,7 +307,7 @@ wait_for_silver_data() {
 }
 
 build_local_silver_delta_manifest() {
-  mkdir -p "${NODE3_STATE_DIR}"
+  ensure_path_writable "${NODE3_STATE_DIR}"
   : > "${NODE3_CURRENT_SILVER_DELTA_MANIFEST}"
   rm -f "${NODE3_CURRENT_SILVER_WATERMARK_FILE}"
   rm -f "${NODE3_CURRENT_SILVER_PENDING_TOTAL_FILE}"
@@ -420,12 +431,14 @@ stop_stale_h2o_processes() {
 }
 
 bootstrap_local_gold_snapshot() {
-  mkdir -p "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}" "${LOCAL_GOLD_RETRAIN_CSV_PATH}"
+  ensure_path_writable "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}"
+  ensure_path_writable "${LOCAL_GOLD_RETRAIN_CSV_PATH}"
 
   if [ "${NODE3_RESET_LOCAL_GOLD_SNAPSHOT}" = "true" ]; then
     echo "Resetting the local Gold snapshot because NODE3_RESET_LOCAL_GOLD_SNAPSHOT=true."
     sudo rm -rf "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}" "${LOCAL_GOLD_RETRAIN_CSV_PATH}"
-    mkdir -p "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}" "${LOCAL_GOLD_RETRAIN_CSV_PATH}"
+    ensure_path_writable "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}"
+    ensure_path_writable "${LOCAL_GOLD_RETRAIN_CSV_PATH}"
   fi
 
   if find "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}" -type f -name "*.parquet" -print -quit | grep -q .; then
@@ -527,7 +540,9 @@ export NODE3_LAST_SUCCESSFUL_SILVER_WATERMARK_FILE
 
 wait_for_silver_data
 
-mkdir -p "${LOCAL_SILVER_FEATURES_PATH}" "${LOCAL_GOLD_RETRAIN_PATH}"
+ensure_path_writable "${LOCAL_CLOUD_DATA_DIR}"
+ensure_path_writable "${LOCAL_SILVER_FEATURES_PATH}"
+ensure_path_writable "${LOCAL_GOLD_RETRAIN_PATH}"
 
 echo "Syncing Silver data from GCS to local disk for Spark processing."
 echo "GCS Silver:   ${SILVER_FEATURES_PATH}"
@@ -539,7 +554,7 @@ echo "Local Silver: ${LOCAL_SILVER_FEATURES_PATH}"
 if [ "${NODE3_RESET_LOCAL_SILVER_SNAPSHOT}" = "true" ]; then
   echo "Resetting the local Silver snapshot before sync because NODE3_RESET_LOCAL_SILVER_SNAPSHOT=true."
   sudo rm -rf "${LOCAL_SILVER_FEATURES_PATH}"
-  mkdir -p "${LOCAL_SILVER_FEATURES_PATH}"
+  ensure_path_writable "${LOCAL_SILVER_FEATURES_PATH}"
   # When resetting, we MUST re-sync from GCS to have data for Spark
   echo "Full re-sync from GCS after local reset..."
   gcloud storage rsync -r "${SILVER_FEATURES_PATH}" "${LOCAL_SILVER_FEATURES_PATH}" || {
@@ -592,9 +607,9 @@ echo "Local Silver snapshot is ready. Sample file: ${LOCAL_SILVER_SAMPLE_FILE}"
 
 echo "Preparing local Spark output directories with container-writable permissions."
 bootstrap_local_gold_snapshot
-mkdir -p "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}" "${LOCAL_GOLD_RETRAIN_CSV_PATH}"
-sudo chown -R "$(id -u):$(id -g)" "${LOCAL_CLOUD_DATA_DIR}"
-sudo chmod -R a+rwX "${LOCAL_CLOUD_DATA_DIR}"
+ensure_path_writable "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}"
+ensure_path_writable "${LOCAL_GOLD_RETRAIN_CSV_PATH}"
+ensure_path_writable "${LOCAL_CLOUD_DATA_DIR}"
 
 echo "Running Spark silver-to-gold job once. Existing checkpoints/data are preserved."
 compose_cmd \
@@ -716,6 +731,7 @@ fi
 
 H2O_MAX_RUNTIME="${NODE3_H2O_MAX_RUNTIME:-${H2O_MAX_RUNTIME:-3600}}" \
   H2O_NTHREADS="${NODE3_H2O_NTHREADS:-${H2O_NTHREADS:-2}}" \
+  RETRAIN_BATCH_ID="${NODE3_CURRENT_BATCH_ID}" \
   RETRAIN_DATA_PATH="${LOCAL_GOLD_RETRAIN_CSV_PATH}" \
   "${RETRAINING_PYTHON}" ml/training/h2o_after_2020.py
 

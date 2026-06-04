@@ -21,6 +21,18 @@ TRACKED_METRICS = [
 ]
 
 
+def _is_retrain_run(row: Any) -> bool:
+    run_name = str(_clean_value(row.get("tags.mlflow.runName")) or "")
+    run_type_tag = str(_clean_value(row.get("tags.run_type")) or "")
+    run_type_param = str(_clean_value(row.get("params.run_type")) or "")
+    return (
+        run_name == "h2o_retrain_online"
+        or run_name.startswith("retrain_top")
+        or run_type_tag == "retrain_online"
+        or run_type_param == "retrain_online"
+    )
+
+
 def _clean_value(value: Any) -> Any:
     if value is None:
         return None
@@ -78,11 +90,13 @@ def retrain_history(limit: int = 30) -> dict[str, Any]:
 
         runs = mlflow.search_runs(
             experiment_ids=[experiment.experiment_id],
-            max_results=limit,
+            max_results=max(limit * 4, 100),
             order_by=["start_time DESC"],
         )
         output = []
         for _, row in runs.iterrows():
+            if not _is_retrain_run(row):
+                continue
             metrics = {
                 metric: _clean_value(row.get(f"metrics.{metric}"))
                 for metric in TRACKED_METRICS
@@ -93,6 +107,11 @@ def retrain_history(limit: int = 30) -> dict[str, Any]:
                     "run_id": _clean_value(row.get("run_id")),
                     "run_name": _clean_value(row.get("tags.mlflow.runName")),
                     "status": _clean_value(row.get("status")),
+                    "run_type": _clean_value(row.get("tags.run_type"))
+                    or _clean_value(row.get("params.run_type")),
+                    "run_role": _clean_value(row.get("tags.run_role")),
+                    "retrain_batch_id": _clean_value(row.get("tags.retrain_batch_id"))
+                    or _clean_value(row.get("params.retrain_batch_id")),
                     "start_time": (
                         row.get("start_time").isoformat()
                         if row.get("start_time") is not None
@@ -106,6 +125,8 @@ def retrain_history(limit: int = 30) -> dict[str, Any]:
                     "metrics": metrics,
                 }
             )
+            if len(output) >= limit:
+                break
         output = _backfill_seed_runs(output, limit)
         return {
             "status": "ok" if output else "not_enough_data",
