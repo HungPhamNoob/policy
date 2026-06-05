@@ -79,17 +79,43 @@ def _table_row_estimate(table_name: str) -> int:
     return max(0, int(row.get("row_estimate") or 0)) if row else 0
 
 
-def _latest_processed_replay_row_index(table: sql.Identifier) -> int | None:
+def _columns_for_table(table_name: str) -> set[str]:
+    rowset = fetch_all(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = %(table_name)s
+        """,
+        {"table_name": _public_table_name(table_name)},
+    )
+    return {str(row["column_name"]) for row in rowset if row.get("column_name")}
+
+
+def _activity_time_column(columns: set[str]) -> str | None:
+    # Order matters: prefer processed/ingest timestamp if present.
+    for candidate in ("processed_time", "created_at", "inserted_at", "updated_at", "event_time"):
+        if candidate in columns:
+            return candidate
+    return None
+
+
+def _latest_processed_replay_row_index(
+    *,
+    table_name: str,
+    table: sql.Identifier,
+) -> int | None:
+    columns = _columns_for_table(table_name)
+    time_column = _activity_time_column(columns) or "processed_time"
     row = fetch_one(
         sql.SQL(
             """
             SELECT (regexp_match(event_id, '@c[0-9]+-p[0-9]+-r([0-9]+)$'))[1]::BIGINT AS replay_row_index
             FROM {table}
             WHERE event_id ~ '@c[0-9]+-p[0-9]+-r[0-9]+$'
-            ORDER BY processed_time DESC NULLS LAST
+            ORDER BY {time_column} DESC NULLS LAST
             LIMIT 1
             """
-        ).format(table=table)
+        ).format(table=table, time_column=sql.Identifier(time_column))
     ) or {}
     value = row.get("replay_row_index")
     table_key = str(table)
@@ -112,6 +138,11 @@ def _load_overview_source(
     prefer_exact_total: bool = False,
 ) -> dict[str, Any]:
     """Return fast source metrics without full-table scans on large replay tables."""
+    columns = _columns_for_table(table_name)
+    activity_column = _activity_time_column(columns)
+    activity_expr: sql.Composable = (
+        sql.Identifier(activity_column) if activity_column else sql.SQL("NULL")
+    )
     total_estimate = _table_row_estimate(table_name)
     if prefer_exact_total or total_estimate <= OVERVIEW_RISK_SAMPLE_LIMIT:
         total_row = fetch_one(
@@ -129,11 +160,11 @@ def _load_overview_source(
             WITH recent AS (
                 SELECT
                     event_time,
-                    processed_time,
+                    {activity_expr} AS processed_time,
                     {risk_score} AS risk_score
                 FROM {table}
-                WHERE processed_time IS NOT NULL OR event_time IS NOT NULL
-                ORDER BY processed_time DESC NULLS LAST, event_time DESC NULLS LAST
+                WHERE {activity_expr} IS NOT NULL OR event_time IS NOT NULL
+                ORDER BY {activity_expr} DESC NULLS LAST, event_time DESC NULLS LAST
                 LIMIT %(sample_limit)s
             )
             SELECT
@@ -145,7 +176,7 @@ def _load_overview_source(
             FROM recent
             WHERE risk_score IS NOT NULL
             """
-        ).format(risk_score=risk_score, table=table),
+        ).format(risk_score=risk_score, table=table, activity_expr=activity_expr),
         {"sample_limit": OVERVIEW_RISK_SAMPLE_LIMIT},
     )
     sample_events = int(sample_row.get("sample_events") or 0) if sample_row else 0
@@ -167,7 +198,9 @@ def _load_overview_source(
     latest_event_time = sample_row.get("latest_event_time") if sample_row else None
     replay_progress_events = None
     if table_name == get_settings().us_prediction_table:
-        latest_replay_row_index = _latest_processed_replay_row_index(table)
+        latest_replay_row_index = _latest_processed_replay_row_index(
+            table_name=table_name, table=table
+        )
         if latest_replay_row_index is not None:
             replay_progress_events = latest_replay_row_index + 1
 
