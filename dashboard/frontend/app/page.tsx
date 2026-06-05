@@ -54,7 +54,7 @@ export default function DashboardPage() {
   const [minRisk, setMinRisk] = useState(0);
   const [showHeatmap, setShowHeatmap] = useState(true);
   const [selected, setSelected] = useState<PredictionPoint | null>(null);
-  const [mode, setMode] = useState<MapMode>("full");
+  const [mode, setMode] = useState<MapMode>("replay");
   const mapPointLimit = DASHBOARD_MAP_POINT_LIMITS[mode];
 
   const summaryQuery = useQuery({
