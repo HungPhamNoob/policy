@@ -19,6 +19,7 @@ import { KpiCard } from "@/components/DataState";
 
 type AnyRecord = Record<string, any>;
 const UI_BUILD_TAG = "ui-20260605-0213";
+const NAV_BUILD_VERSION = "ui-20260605-0320";
 
 const SERVICE_URLS: Record<string, string> = {
   kafka: "",
@@ -225,11 +226,16 @@ export default function PipelinePage() {
           <h1>Pipeline Health</h1>
           <p>Operational view for Kafka, Flink, Spark, PostGIS, MLflow and retrain runs.</p>
         </div>
-        <span className="status-pill">
-          <Activity size={14} />
-          {health.data?.status || "unavailable"}
-        </span>
-        <span className="status-pill">{UI_BUILD_TAG}</span>
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <a className="ghost-button" href={`/?v=${NAV_BUILD_VERSION}`}>
+            Dashboard
+          </a>
+          <span className="status-pill">
+            <Activity size={14} />
+            {health.data?.status || "unavailable"}
+          </span>
+          <span className="status-pill">{UI_BUILD_TAG}</span>
+        </div>
       </div>
 
       <section className="grid kpi-grid">

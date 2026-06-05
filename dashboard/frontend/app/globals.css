@@ -60,6 +60,7 @@ button {
   display: flex;
   flex-direction: column;
   gap: 24px;
+  z-index: 20;
 }
 
 .brand,
@@ -119,11 +120,20 @@ button {
   border-radius: 8px;
   background: rgba(15, 23, 42, 0.54);
   color: #cbd5e1;
+  position: relative;
+  z-index: 1;
+  cursor: pointer;
 }
 
 .nav-item:hover {
   border-color: rgba(56, 189, 248, 0.55);
   color: #fff;
+}
+
+.nav-item.active {
+  border-color: rgba(56, 189, 248, 0.75);
+  background: rgba(14, 165, 233, 0.16);
+  color: #f8fafc;
 }
 
 .sidebar-footer {

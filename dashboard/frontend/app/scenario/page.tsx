@@ -168,6 +168,7 @@ const extraPresets: Record<string, ScenarioInput> = {
 };
 
 const allPresets = { ...scenarioPresets, ...extraPresets };
+const NAV_BUILD_VERSION = "ui-20260605-0320";
 const presetSeverityByName: Record<string, number> = {
   "Normal commute": 2,
   "Rainy rush hour": 4,
@@ -285,10 +286,15 @@ export default function ScenarioPage() {
           <h1>Scenario Simulator</h1>
           <p>Modify road and weather conditions to test risk predictions.</p>
         </div>
-        <span className="status-pill">
-          <FlaskConical size={14} />
-          What-if inference
-        </span>
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <a className="ghost-button" href={`/?v=${NAV_BUILD_VERSION}`}>
+            Dashboard
+          </a>
+          <span className="status-pill">
+            <FlaskConical size={14} />
+            What-if inference
+          </span>
+        </div>
       </div>
 
       <FallbackBanner
