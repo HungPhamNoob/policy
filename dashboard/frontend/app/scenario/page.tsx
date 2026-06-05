@@ -168,7 +168,7 @@ const extraPresets: Record<string, ScenarioInput> = {
 };
 
 const allPresets = { ...scenarioPresets, ...extraPresets };
-const NAV_BUILD_VERSION = "ui-20260605-0320";
+const NAV_BUILD_VERSION = "ui-20260605-0330";
 const presetSeverityByName: Record<string, number> = {
   "Normal commute": 2,
   "Rainy rush hour": 4,

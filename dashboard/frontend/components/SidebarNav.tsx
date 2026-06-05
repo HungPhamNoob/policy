@@ -14,7 +14,7 @@ const icons = {
   "shield-alert": ShieldAlert,
   "git-branch": GitBranch
 } as const;
-const NAV_BUILD_VERSION = "ui-20260605-0320";
+const NAV_BUILD_VERSION = "ui-20260605-0330";
 
 export function SidebarNav({ items }: { items: NavItem[] }) {
   const pathname = usePathname();
