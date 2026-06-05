@@ -142,20 +142,30 @@ const EARLY_COMPATIBILITY_SCRIPT = `
     const predictionSource = (replayHealth.sources || []).find(
       (item) => String(item.table) === "traffic_risk_predictions"
     ) || {};
+    const replayProgressValue =
+      replayHealth.row_count ??
+      predictionSource.row_count ??
+      summary.replay_progress_events ??
+      summary.total_events;
+    const replayLatestValue =
+      predictionSource.latest_created_at ||
+      predictionSource.latest_event_time ||
+      (replayHealth.retrain_loop || {}).latest_prediction_time ||
+      summary.latest_event_time;
 
     if (path === "/") {
       setCard(
         findCard(["Total events", "Replay progress"]),
         "Replay progress",
-        fmtNum(summary.replay_progress_events ?? summary.total_events),
-        "processed replay rows: " + fmtNum(summary.replay_progress_events ?? summary.total_events) +
+        fmtNum(replayProgressValue),
+        "processed replay rows: " + fmtNum(replayProgressValue) +
           " | stored rows: " + fmtNum(predictionSource.stored_row_count || replayHealth.total_row_count || summary.total_events)
       );
       setCard(
         findCard(["Latest event"]),
         "Latest event",
-        summary.latest_event_time ? "Online" : "No data",
-        fmtTs(summary.latest_event_time)
+        replayLatestValue ? "Online" : "No data",
+        fmtTs(replayLatestValue)
       );
       patchPredictionsTable(latest.predictions || []);
     }

@@ -144,20 +144,30 @@ async function patchDom() {
     (replayHealth.sources || []).find(
       (item: any) => String(item.table) === "traffic_risk_predictions"
     ) || {};
+  const replayProgressValue =
+    replayHealth.row_count ??
+    predictionSource.row_count ??
+    summary.replay_progress_events ??
+    summary.total_events;
+  const replayLatestValue =
+    predictionSource.latest_created_at ||
+    predictionSource.latest_event_time ||
+    replayHealth.retrain_loop?.latest_prediction_time ||
+    summary.latest_event_time;
 
   if (path === "/") {
     setCard(
       findCardByLabels(["Total events", "Replay progress"]),
       "Replay progress",
-      fmtNum(summary.replay_progress_events ?? summary.total_events),
-      `processed replay rows: ${fmtNum(summary.replay_progress_events ?? summary.total_events)}` +
+      fmtNum(replayProgressValue),
+      `processed replay rows: ${fmtNum(replayProgressValue)}` +
         ` | stored rows: ${fmtNum(predictionSource.stored_row_count || replayHealth.total_row_count || summary.total_events)}`
     );
     setCard(
       findCardByLabels(["Latest event"]),
       "Latest event",
-      summary.latest_event_time ? "Online" : "No data",
-      summary.latest_event_time ? formatTs(summary.latest_event_time) : "Waiting for replay"
+      replayLatestValue ? "Online" : "No data",
+      replayLatestValue ? formatTs(replayLatestValue) : "Waiting for replay"
     );
     patchPredictionsTable(latest.predictions || []);
   }
@@ -184,6 +194,7 @@ async function patchDom() {
 export function CompatibilityPatch() {
   useEffect(() => {
     let cancelled = false;
+    let mutationTimer: number | null = null;
 
     const run = async () => {
       try {
@@ -197,9 +208,27 @@ export function CompatibilityPatch() {
 
     run();
     const timer = window.setInterval(run, 15_000);
+    const observer = new MutationObserver(() => {
+      if (cancelled) return;
+      if (mutationTimer !== null) {
+        window.clearTimeout(mutationTimer);
+      }
+      mutationTimer = window.setTimeout(() => {
+        void run();
+      }, 200);
+    });
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true
+    });
     return () => {
       cancelled = true;
+      observer.disconnect();
       window.clearInterval(timer);
+      if (mutationTimer !== null) {
+        window.clearTimeout(mutationTimer);
+      }
     };
   }, []);
 
