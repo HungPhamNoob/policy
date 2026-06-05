@@ -18,6 +18,7 @@ import { formatVietnamTimestamp, formatVietnamTimestampLabel } from "@/lib/time"
 import { KpiCard } from "@/components/DataState";
 
 type AnyRecord = Record<string, any>;
+const UI_BUILD_TAG = "ui-20260605-0213";
 
 const SERVICE_URLS: Record<string, string> = {
   kafka: "",
@@ -115,6 +116,19 @@ export default function PipelinePage() {
   const replayRowCount = Number(
     replayPredictionSource?.row_count ?? replayData?.row_count ?? 0
   );
+  const latestReplayRowIndex = Number(
+    replayPredictionSource?.latest_replay_row_index ?? 0
+  );
+  const replayDisplayCount = latestReplayRowIndex > 0
+    ? latestReplayRowIndex + 1
+    : replayRowCount;
+  const latestReplayInsert = formatVietnamTimestamp(
+    replayPredictionSource?.latest_created_at,
+    "n/a"
+  );
+  const replayProgressDetail = latestReplayRowIndex > 0
+    ? `processed replay rows: ${replayDisplayCount.toLocaleString()} | stored rows: ${replayRowCount.toLocaleString()} | latest insert: ${latestReplayInsert}`
+    : String(replayData?.retrain_policy || "new_silver_data_only");
 
   // Retrain loop from backend's retrain_loop field (CONTINUE/FINISHED/FAILED)
   const retrainLoop = (replayData?.retrain_loop as AnyRecord | undefined) || {};
@@ -215,6 +229,7 @@ export default function PipelinePage() {
           <Activity size={14} />
           {health.data?.status || "unavailable"}
         </span>
+        <span className="status-pill">{UI_BUILD_TAG}</span>
       </div>
 
       <section className="grid kpi-grid">
@@ -242,9 +257,9 @@ export default function PipelinePage() {
           detail={avgLatencyDetail}
         />
         <KpiCard
-          label="Prediction rows"
-          value={replayRowCount.toLocaleString()}
-          detail={String(replayData?.retrain_policy || "new_silver_data_only")}
+          label="Replay progress"
+          value={replayDisplayCount.toLocaleString()}
+          detail={replayProgressDetail}
         />
         <KpiCard
           label="Model"
@@ -318,11 +333,15 @@ export default function PipelinePage() {
                       <span className="status-pill">{String(item.status || "unavailable")}</span>
                     </div>
                     <span className="muted">
-                      rows: {Number(item.row_count || 0).toLocaleString()} | latest event: {formatVietnamTimestamp(item.latest_event_time, "n/a")}
+                      {String(item.table) === "traffic_risk_predictions" && item.latest_replay_row_index !== null && item.latest_replay_row_index !== undefined
+                        ? `processed replay rows: ${(Number(item.latest_replay_row_index || 0) + 1).toLocaleString()} | stored rows: ${Number(item.row_count || 0).toLocaleString()} | latest processed: ${formatVietnamTimestamp(item.latest_created_at, "n/a")}`
+                        : `rows: ${Number(item.row_count || 0).toLocaleString()} | latest event: ${formatVietnamTimestamp(item.latest_event_time, "n/a")}`}
                     </span>
-                    <span className="muted">
-                      latest insert: {formatVietnamTimestamp(item.latest_created_at, "n/a")}
-                    </span>
+                    {!(String(item.table) === "traffic_risk_predictions" && item.latest_replay_row_index !== null && item.latest_replay_row_index !== undefined) ? (
+                      <span className="muted">
+                        latest insert: {formatVietnamTimestamp(item.latest_created_at, "n/a")}
+                      </span>
+                    ) : null}
                   </div>
                 ))
               : ["flink", "gold"].map((key) => {

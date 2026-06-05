@@ -40,6 +40,7 @@ async function request<T>(
 ): Promise<T> {
   const response = await fetch(buildUrl(path, options?.params), {
     ...options,
+    cache: "no-store",
     headers: {
       "Content-Type": "application/json",
       ...(options?.headers || {})

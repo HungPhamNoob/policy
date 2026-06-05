@@ -23,6 +23,7 @@ EXPENSIVE_SCAN_ROW_THRESHOLD = 500_000
 _RETRAIN_LOOP_CACHE: dict[str, Any] = {}
 _RETRAIN_LOOP_CACHE_TS: float = 0.0
 _RETRAIN_LOOP_CACHE_TTL_S = 30.0
+_REPLAY_PROGRESS_CACHE: dict[str, int] = {}
 
 
 def _is_root_retrain_run(row: Any) -> bool:
@@ -155,6 +156,45 @@ def _latest_table_timestamp(table_name: str, column: str) -> datetime | None:
     )
     row = fetch_one(query) or {}
     return _coerce_utc_timestamp(row.get("latest_time"))
+
+
+def _latest_source_timestamp(table_name: str, column: str | None) -> datetime | None:
+    if not column:
+        return None
+    if _skip_expensive_time_scan(table_name, column):
+        return None
+    return _latest_table_timestamp(table_name, column)
+
+
+def _latest_replay_row_index(
+    table_name: str,
+    column: str | None,
+) -> int | None:
+    if not column:
+        return None
+    query = sql.SQL(
+        """
+        SELECT (regexp_match(event_id, '@c[0-9]+-p[0-9]+-r([0-9]+)$'))[1]::BIGINT AS replay_row_index
+        FROM {table}
+        WHERE event_id ~ '@c[0-9]+-p[0-9]+-r[0-9]+$'
+        ORDER BY {time_column} DESC NULLS LAST
+        LIMIT 1
+        """
+    ).format(
+        table=table_identifier(table_name),
+        time_column=sql.Identifier(column),
+    )
+    row = fetch_one(query) or {}
+    value = row.get("replay_row_index")
+    if value is None:
+        return _REPLAY_PROGRESS_CACHE.get(table_name)
+    replay_row_index = int(value)
+    replay_row_index = max(
+        replay_row_index,
+        _REPLAY_PROGRESS_CACHE.get(table_name, replay_row_index),
+    )
+    _REPLAY_PROGRESS_CACHE[table_name] = replay_row_index
+    return replay_row_index
 
 
 def _table_row_estimate(table_name: str) -> int:
@@ -514,24 +554,50 @@ def _compute_retrain_loop_status(
     idle_window_minutes = airflow_schedule_minutes * 3
     data_stale_window_seconds = idle_window_minutes * 60
 
-    # Latest event time across ALL sources (prediction + tomtom)
+    # Latest pipeline activity across ALL sources (prediction + tomtom).
+    # For replay datasets, event_time is historical and should not be used to
+    # decide whether the pipeline is still making progress.
     latest_prediction_time: datetime | None = None
     latest_tomtom_time: datetime | None = None
+    latest_prediction_event_time: datetime | None = None
+    latest_tomtom_event_time: datetime | None = None
     for source in source_health:
+        event_time = None
+        activity_time = None
         et_str = source.get("latest_event_time")
-        if not et_str:
-            continue
+        activity_str = source.get("latest_created_at")
         try:
-            et = datetime.fromisoformat(et_str)
+            if et_str:
+                event_time = datetime.fromisoformat(et_str)
         except (ValueError, TypeError):
-            continue
+            event_time = None
+        try:
+            if activity_str:
+                activity_time = datetime.fromisoformat(activity_str)
+        except (ValueError, TypeError):
+            activity_time = None
         table = source.get("table", "")
         if "tomtom" in table.lower():
-            if latest_tomtom_time is None or et > latest_tomtom_time:
-                latest_tomtom_time = et
+            if event_time is not None and (
+                latest_tomtom_event_time is None or event_time > latest_tomtom_event_time
+            ):
+                latest_tomtom_event_time = event_time
+            candidate = activity_time or event_time
+            if candidate is not None and (
+                latest_tomtom_time is None or candidate > latest_tomtom_time
+            ):
+                latest_tomtom_time = candidate
         else:
-            if latest_prediction_time is None or et > latest_prediction_time:
-                latest_prediction_time = et
+            if event_time is not None and (
+                latest_prediction_event_time is None
+                or event_time > latest_prediction_event_time
+            ):
+                latest_prediction_event_time = event_time
+            candidate = activity_time or event_time
+            if candidate is not None and (
+                latest_prediction_time is None or candidate > latest_prediction_time
+            ):
+                latest_prediction_time = candidate
 
     now = datetime.now(timezone.utc)
     has_prediction_data = replay_rows > 0
@@ -617,6 +683,14 @@ def _compute_retrain_loop_status(
             f"{recent_finished_count} retrain batches completed successfully. "
             f"Latest event: {latest_event_time.isoformat() if latest_event_time else 'N/A'}."
         )
+    elif has_prediction_data and prediction_is_stale and latest_tomtom_time is not None and not tomtom_is_stale:
+        loop_status = "stalled"
+        loop_reason = (
+            "US replay/prediction ingestion has stopped advancing while TomTom live traffic is still flowing. "
+            f"Latest prediction activity: {latest_prediction_time.isoformat() if latest_prediction_time else 'N/A'}. "
+            f"Latest prediction event timestamp: {latest_prediction_event_time.isoformat() if latest_prediction_event_time else 'N/A'}. "
+            f"Latest TomTom activity: {latest_tomtom_time.isoformat()}."
+        )
     else:
         loop_status = "continue"
         parts = []
@@ -636,6 +710,14 @@ def _compute_retrain_loop_status(
         "latest_event_time": latest_event_time.isoformat() if latest_event_time else None,
         "latest_prediction_time": latest_prediction_time.isoformat() if latest_prediction_time else None,
         "latest_tomtom_time": latest_tomtom_time.isoformat() if latest_tomtom_time else None,
+        "latest_prediction_event_time": (
+            latest_prediction_event_time.isoformat()
+            if latest_prediction_event_time
+            else None
+        ),
+        "latest_tomtom_event_time": (
+            latest_tomtom_event_time.isoformat() if latest_tomtom_event_time else None
+        ),
         "schedule_interval_minutes": airflow_schedule_minutes,
         "schedule_window_minutes": airflow_schedule_minutes,
         "idle_window_minutes": idle_window_minutes,
@@ -668,10 +750,16 @@ def replay_health() -> dict[str, Any]:
             continue
 
         latest_event_time = None
-        if "event_time" in columns and not _skip_expensive_time_scan(
-            table_name, "event_time"
-        ):
-            latest_event_time = _latest_table_timestamp(table_name, "event_time")
+        activity_column = _time_column(columns)
+        latest_insert_time = _latest_source_timestamp(table_name, activity_column)
+        latest_replay_row_index = None
+        if table_name == settings.us_prediction_table.split(".")[-1]:
+            latest_replay_row_index = _latest_replay_row_index(
+                table_name,
+                activity_column,
+            )
+        if "event_time" in columns:
+            latest_event_time = _latest_source_timestamp(table_name, "event_time")
         row_estimate = _table_row_estimate(table_name)
         if (
             table_name == settings.us_prediction_table.split(".")[-1]
@@ -680,20 +768,32 @@ def replay_health() -> dict[str, Any]:
             row_count = _exact_table_row_count(table_name)
         else:
             row_count = row_estimate
-        total_rows += row_count
+        stored_row_count = row_count
+        compatibility_latest_event_time = latest_event_time
+        compatibility_row_count = row_count
+        if latest_replay_row_index is not None:
+            compatibility_row_count = latest_replay_row_index + 1
+            compatibility_latest_event_time = latest_insert_time or latest_event_time
+        total_rows += stored_row_count
         if table_name == settings.us_prediction_table.split(".")[-1]:
-            replay_rows = row_count
+            replay_rows = compatibility_row_count
 
         source_health.append(
             {
                 "table": table_name,
-                "status": "ok" if row_count else "not_enough_data",
-                "row_count": row_count,
+                "status": "ok" if compatibility_row_count else "not_enough_data",
+                "row_count": compatibility_row_count,
+                "stored_row_count": stored_row_count,
                 "row_estimate": row_estimate,
                 "latest_event_time": (
-                    latest_event_time.isoformat() if latest_event_time else None
+                    compatibility_latest_event_time.isoformat()
+                    if compatibility_latest_event_time
+                    else None
                 ),
-                "latest_created_at": None,
+                "latest_created_at": (
+                    latest_insert_time.isoformat() if latest_insert_time else None
+                ),
+                "latest_replay_row_index": latest_replay_row_index,
                 "model_status": [],
             }
         )

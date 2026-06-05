@@ -343,6 +343,66 @@ def test_retrain_loop_marks_incomplete_latest_parent_as_failed(monkeypatch):
     assert result["latest_retrain_incomplete"] is True
 
 
+def test_retrain_loop_marks_prediction_stall_while_tomtom_is_live(monkeypatch):
+    pipeline_service._RETRAIN_LOOP_CACHE = {}
+    pipeline_service._RETRAIN_LOOP_CACHE_TS = 0.0
+
+    class FakeMlflow:
+        @staticmethod
+        def set_tracking_uri(uri):
+            return None
+
+        @staticmethod
+        def get_experiment_by_name(name):
+            return type("Experiment", (), {"experiment_id": "1"})()
+
+        @staticmethod
+        def search_runs(experiment_ids, max_results, order_by):
+            class FakeDataFrame:
+                def iterrows(self):
+                    rows = [
+                        {
+                            "tags.mlflow.runName": "h2o_retrain_online",
+                            "params.run_type": "retrain_online",
+                            "tags.run_role": "retrain_parent",
+                            "status": "FINISHED",
+                            "params.top_k_models": "10",
+                            "metrics.models_logged": 10.0,
+                        }
+                    ]
+                    for idx, row in enumerate(rows):
+                        yield idx, row
+
+            return FakeDataFrame()
+
+    monkeypatch.setitem(sys.modules, "mlflow", FakeMlflow)
+
+    settings = pipeline_service.get_settings()
+    now = datetime.now(timezone.utc)
+    source_health = [
+        {
+            "table": "traffic_risk_predictions",
+            "latest_event_time": "2023-03-31T23:21:00+00:00",
+            "latest_created_at": (now - timedelta(minutes=180)).isoformat(),
+        },
+        {
+            "table": "traffic_tomtom_incidents",
+            "latest_event_time": now.isoformat(),
+            "latest_created_at": now.isoformat(),
+        },
+    ]
+
+    result = pipeline_service._compute_retrain_loop_status(
+        source_health,
+        replay_rows=100,
+        settings=settings,
+    )
+
+    assert result["status"] == "stalled"
+    assert result["prediction_is_stale"] is True
+    assert result["tomtom_is_stale"] is False
+
+
 def test_retrain_history_filters_non_retrain_runs(monkeypatch):
     from app.services import model_service
 

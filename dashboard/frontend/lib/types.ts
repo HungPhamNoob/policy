@@ -19,6 +19,7 @@ export type ModelPerformance = {
 
 export type OverviewSummary = {
   total_events: number;
+  replay_progress_events?: number | null;
   high_risk_events: number;
   avg_risk_score: number;
   latest_event_time: string | null;
@@ -37,6 +38,7 @@ export type PredictionPoint = {
   predicted_severity: number | null;
   true_severity: number | null;
   event_time: string | null;
+  processed_time?: string | null;
   model_status: string;
   risk_level: RiskLevel;
   data_source?: "us_replay" | "tomtom_live";

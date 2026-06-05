@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { Activity, BarChart3, GitBranch, Map, ShieldAlert } from "lucide-react";
+import { CompatibilityPatch } from "@/components/CompatibilityPatch";
 import "./globals.css";
 import { Providers } from "./providers";
 
@@ -20,6 +21,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en">
       <body>
         <Providers>
+          <CompatibilityPatch />
           <div className="app-shell">
             <aside className="sidebar">
               <div className="brand">

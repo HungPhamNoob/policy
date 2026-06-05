@@ -1,10 +1,11 @@
 """FastAPI entrypoint for the Traffic Risk Assessment dashboard backend."""
 
+import logging
+import time
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from starlette.responses import Response
-import time
 
 from app.routes import (
     analytics,
@@ -28,6 +29,13 @@ REQUEST_LATENCY = Histogram(
     "HTTP request latency in seconds for the Traffic Risk API.",
     ["method", "path"],
 )
+REQUEST_DEBUG_LOG = logging.getLogger("traffic.api.request_debug")
+DEBUG_PATH_PREFIXES = (
+    "/api/v1/overview/summary",
+    "/api/v1/predictions/latest",
+    "/api/v1/pipeline/replay-health",
+)
+API_RESPONSE_VERSION = "api-20260605-0226"
 
 
 app = FastAPI(
@@ -64,6 +72,22 @@ async def collect_request_metrics(request, call_next):
     response = await call_next(request)
     elapsed = time.perf_counter() - start_time
     path = request.url.path
+    if path.startswith("/api/v1/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, max-age=0, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        response.headers["X-TrafficRisk-API-Version"] = API_RESPONSE_VERSION
+    if any(path.startswith(prefix) for prefix in DEBUG_PATH_PREFIXES):
+        REQUEST_DEBUG_LOG.warning(
+            "dashboard_request path=%s query=%s status=%s client=%s origin=%s referer=%s ua=%s",
+            path,
+            request.url.query,
+            response.status_code,
+            request.client.host if request.client else "unknown",
+            request.headers.get("origin", ""),
+            request.headers.get("referer", ""),
+            request.headers.get("user-agent", ""),
+        )
     REQUEST_COUNT.labels(request.method, path, str(response.status_code)).inc()
     REQUEST_LATENCY.labels(request.method, path).observe(elapsed)
     return response

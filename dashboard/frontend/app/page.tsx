@@ -1,6 +1,6 @@
 "use client";
 
-import dynamic from "next/dynamic";
+import nextDynamic from "next/dynamic";
 import Link from "next/link";
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -21,7 +21,7 @@ import { formatVietnamTimestamp } from "@/lib/time";
 import type { Hotspot, MapMode, ModelPerformance, OverviewSummary, PredictionPoint } from "@/lib/types";
 import { FallbackBanner, KpiCard } from "@/components/DataState";
 
-const RiskMap = dynamic(
+const RiskMap = nextDynamic(
   () => import("@/components/RiskMap").then((module) => module.RiskMap),
   { ssr: false }
 );
@@ -32,6 +32,7 @@ const DASHBOARD_MAP_POINT_LIMITS: Record<MapMode, number> = {
   full: 1500
 };
 const DASHBOARD_LATEST_PREDICTIONS_LIMIT = 30;
+const UI_BUILD_TAG = "ui-20260605-0213";
 const displayEventId = (eventId: string) => eventId.split("@")[0] || eventId;
 const EMPTY_SUMMARY: OverviewSummary = {
   total_events: 0,
@@ -115,6 +116,13 @@ export default function DashboardPage() {
   const points = (pointsQuery.data?.points as PredictionPoint[] | undefined) || [];
   const latest =
     (latestQuery.data?.predictions as PredictionPoint[] | undefined) || [];
+  const displayedTotalEvents = Number(
+    summary.replay_progress_events ?? summary.total_events ?? 0
+  );
+  const totalEventsDetail =
+    mode === "replay" && summary.replay_progress_events !== null && summary.replay_progress_events !== undefined
+      ? `processed replay rows: ${displayedTotalEvents.toLocaleString()} | stored rows: ${Number(summary.total_events || 0).toLocaleString()}`
+      : undefined;
   const hotspots = (hotspotsQuery.data?.hotspots as Hotspot[] | undefined) || [];
   const fallbackActive =
     summaryQuery.isError ||
@@ -177,13 +185,18 @@ export default function DashboardPage() {
             <RefreshCw size={14} />
             Auto-refresh 15s
           </span>
+          <span className="status-pill">{UI_BUILD_TAG}</span>
         </div>
       </div>
 
       <FallbackBanner active={fallbackActive} />
 
       <section className="grid kpi-grid">
-        <KpiCard label="Total events" value={summary.total_events.toLocaleString()} />
+        <KpiCard
+          label={mode === "replay" ? "Replay progress" : "Total events"}
+          value={displayedTotalEvents.toLocaleString()}
+          detail={totalEventsDetail}
+        />
         <KpiCard
           label="High risk"
           value={summary.high_risk_events.toLocaleString()}
@@ -396,7 +409,7 @@ export default function DashboardPage() {
                   <td className="mono">{displayEventId(point.event_id)}</td>
                   <td>{Number(point.risk_score).toFixed(4)}</td>
                   <td>{point.predicted_severity ?? point.true_severity ?? "-"}</td>
-                  <td>{formatVietnamTimestamp(point.event_time, "-")}</td>
+                  <td>{formatVietnamTimestamp((point as any).processed_time || point.event_time, "-")}</td>
                   <td>{statusText(point)}</td>
                 </tr>
               )) : (

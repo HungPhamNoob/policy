@@ -29,6 +29,7 @@ OVERVIEW_CACHE_TTL_SECONDS = 20.0
 MAP_POINTS_CACHE_TTL_SECONDS = 15.0
 LATEST_PREDICTIONS_CACHE_TTL_SECONDS = 15.0
 OVERVIEW_RISK_SAMPLE_LIMIT = 5_000
+_REPLAY_PROGRESS_CACHE: dict[str, int] = {}
 
 
 def _public_table_name(value: str) -> str:
@@ -78,6 +79,31 @@ def _table_row_estimate(table_name: str) -> int:
     return max(0, int(row.get("row_estimate") or 0)) if row else 0
 
 
+def _latest_processed_replay_row_index(table: sql.Identifier) -> int | None:
+    row = fetch_one(
+        sql.SQL(
+            """
+            SELECT (regexp_match(event_id, '@c[0-9]+-p[0-9]+-r([0-9]+)$'))[1]::BIGINT AS replay_row_index
+            FROM {table}
+            WHERE event_id ~ '@c[0-9]+-p[0-9]+-r[0-9]+$'
+            ORDER BY processed_time DESC NULLS LAST
+            LIMIT 1
+            """
+        ).format(table=table)
+    ) or {}
+    value = row.get("replay_row_index")
+    table_key = str(table)
+    if value is None:
+        return _REPLAY_PROGRESS_CACHE.get(table_key)
+    replay_row_index = int(value)
+    replay_row_index = max(
+        replay_row_index,
+        _REPLAY_PROGRESS_CACHE.get(table_key, replay_row_index),
+    )
+    _REPLAY_PROGRESS_CACHE[table_key] = replay_row_index
+    return replay_row_index
+
+
 def _load_overview_source(
     *,
     table_name: str,
@@ -103,17 +129,19 @@ def _load_overview_source(
             WITH recent AS (
                 SELECT
                     event_time,
+                    processed_time,
                     {risk_score} AS risk_score
                 FROM {table}
-                WHERE event_time IS NOT NULL
-                ORDER BY event_time DESC NULLS LAST
+                WHERE processed_time IS NOT NULL OR event_time IS NOT NULL
+                ORDER BY processed_time DESC NULLS LAST, event_time DESC NULLS LAST
                 LIMIT %(sample_limit)s
             )
             SELECT
                 COUNT(*)::BIGINT AS sample_events,
                 COALESCE(SUM(CASE WHEN risk_score >= 0.7 THEN 1 ELSE 0 END), 0)::BIGINT AS high_risk_events,
                 COALESCE(SUM(risk_score), 0)::DOUBLE PRECISION AS risk_score_sum,
-                MAX(event_time) AS latest_event_time
+                MAX(event_time) AS latest_event_time,
+                MAX(processed_time) AS latest_processed_time
             FROM recent
             WHERE risk_score IS NOT NULL
             """
@@ -133,14 +161,22 @@ def _load_overview_source(
         if sample_events
         else 0
     )
+    latest_processed_time = (
+        sample_row.get("latest_processed_time") if sample_row else None
+    )
+    latest_event_time = sample_row.get("latest_event_time") if sample_row else None
+    replay_progress_events = None
+    if table_name == get_settings().us_prediction_table:
+        latest_replay_row_index = _latest_processed_replay_row_index(table)
+        if latest_replay_row_index is not None:
+            replay_progress_events = latest_replay_row_index + 1
 
     return {
         "total_events": total_events,
+        "replay_progress_events": replay_progress_events,
         "high_risk_events": high_risk_events,
         "avg_risk_score": avg_risk_score,
-        "latest_event_time": (
-            sample_row.get("latest_event_time") if sample_row else None
-        ),
+        "latest_event_time": latest_processed_time or latest_event_time,
     }
 
 
@@ -239,6 +275,14 @@ def _load_overview_summary(normalized_mode: MapMode) -> dict[str, Any]:
         )
 
     total_events = sum(int(row["total_events"]) for row in source_metrics)
+    replay_progress_events = max(
+        (
+            int(row["replay_progress_events"])
+            for row in source_metrics
+            if row.get("replay_progress_events") is not None
+        ),
+        default=None,
+    )
     high_risk_events = sum(int(row["high_risk_events"]) for row in source_metrics)
     avg_risk_score = (
         sum(
@@ -253,12 +297,18 @@ def _load_overview_summary(normalized_mode: MapMode) -> dict[str, Any]:
         (row["latest_event_time"] for row in source_metrics if row["latest_event_time"]),
         default=None,
     )
+    compatibility_total_events = (
+        replay_progress_events
+        if normalized_mode == "replay" and replay_progress_events is not None
+        else total_events
+    )
 
     # Fetch latest model performance metrics from MLflow.
     model_metrics = _fetch_latest_model_metrics()
 
     return {
-        "total_events": total_events,
+        "total_events": compatibility_total_events,
+        "replay_progress_events": replay_progress_events,
         "high_risk_events": high_risk_events,
         "avg_risk_score": round(avg_risk_score, 4),
         "latest_event_time": (
@@ -532,6 +582,7 @@ def prediction_detail(event_id: str) -> dict[str, Any]:
                 SELECT
                     event_id,
                     event_time,
+                    processed_time,
                     lat,
                     lon,
                     {risk_score} AS risk_score,
@@ -556,6 +607,7 @@ def prediction_detail(event_id: str) -> dict[str, Any]:
                 SELECT
                     event_id,
                     event_time,
+                    processed_time,
                     lat,
                     lon,
                     {risk_score} AS risk_score,
@@ -628,6 +680,7 @@ def _load_latest_predictions(
                 SELECT
                     event_id,
                     event_time,
+                    processed_time,
                     lat,
                     lon,
                     {risk_score} AS risk_score,
@@ -652,6 +705,7 @@ def _load_latest_predictions(
                 SELECT
                     event_id,
                     event_time,
+                    processed_time,
                     lat,
                     lon,
                     {risk_score} AS risk_score,
@@ -676,14 +730,20 @@ def _load_latest_predictions(
         """
         SELECT *
         FROM ({union_query}) AS latest_events
-        ORDER BY event_time DESC NULLS LAST
+        ORDER BY processed_time DESC NULLS LAST, event_time DESC NULLS LAST
         LIMIT %(union_limit)s
         """
     ).format(union_query=sql.SQL(" UNION ALL ").join(selects))
     rows = fetch_all(query, {"limit": limit, "union_limit": union_limit})
     for row in rows:
+        if row.get("processed_time"):
+            row["processed_time"] = row["processed_time"].isoformat()
         if row.get("event_time"):
             row["event_time"] = row["event_time"].isoformat()
+        if normalized_mode == "replay" and row.get("processed_time"):
+            # Backward-compatibility for older dashboard bundles that still
+            # render `event_time` in the "Latest predictions" table.
+            row["event_time"] = row["processed_time"]
         row["risk_level"] = risk_level(row.get("risk_score"))
         row["model_status"] = row.get("model_status") or "unknown"
     return {"predictions": rows}

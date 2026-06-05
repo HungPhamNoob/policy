@@ -112,6 +112,7 @@ compute_us_replay_start_row() {
 import json
 import os
 import urllib.request
+import subprocess
 
 default_value = os.getenv("US_REPLAY_START_ROW", "0")
 table_name = (
@@ -120,6 +121,59 @@ table_name = (
     or "traffic_risk_predictions"
 )
 postgres_host = os.getenv("POSTGRES_HOST", "127.0.0.1")
+
+docker_query = r"""
+import os
+import psycopg2
+from psycopg2 import sql
+
+table_name = (
+    os.getenv("POSTGRES_US_PREDICTION_TABLE")
+    or os.getenv("POSTGRES_PREDICTION_TABLE")
+    or "traffic_risk_predictions"
+)
+
+with psycopg2.connect(
+    host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
+    port=int(os.getenv("POSTGRES_PORT", "5432")),
+    dbname=os.getenv("POSTGRES_DB", "capstone_db"),
+    user=os.getenv("POSTGRES_USER", "capstone"),
+    password=os.getenv("POSTGRES_PASSWORD", ""),
+) as connection:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            sql.SQL(
+                '''
+                SELECT MAX((regexp_match(event_id, '@c[0-9]+-p[0-9]+-r([0-9]+)$'))[1]::bigint)
+                FROM {table}
+                WHERE event_id ~ '@c[0-9]+-p[0-9]+-r[0-9]+$'
+                '''
+            ).format(table=sql.Identifier(table_name))
+        )
+        value = cursor.fetchone()[0]
+        print(max(int(value) + 1, 0) if value is not None else 0)
+"""
+
+try:
+    output = subprocess.check_output(
+        [
+            "sudo",
+            "docker",
+            "exec",
+            "node2-flink-python-job",
+            "python",
+            "-c",
+            docker_query,
+        ],
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=20,
+    ).strip()
+    if output:
+        print(output)
+        raise SystemExit(0)
+except Exception:
+    pass
 
 try:
     with urllib.request.urlopen(
@@ -136,6 +190,7 @@ except Exception:
 
 try:
     import psycopg2
+    from psycopg2 import sql
 except Exception:
     print(default_value)
     raise SystemExit(0)
@@ -149,7 +204,23 @@ try:
         password=os.getenv("POSTGRES_PASSWORD", ""),
     ) as connection:
         with connection.cursor() as cursor:
-            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+            replay_row_query = sql.SQL(
+                """
+                SELECT MAX((regexp_match(event_id, '@c[0-9]+-p[0-9]+-r([0-9]+)$'))[1]::bigint)
+                FROM {table}
+                WHERE event_id ~ '@c[0-9]+-p[0-9]+-r[0-9]+$'
+                """
+            ).format(table=sql.Identifier(table_name))
+            cursor.execute(replay_row_query)
+            replay_row = cursor.fetchone()[0]
+            if replay_row is not None:
+                print(max(int(replay_row) + 1, 0))
+                raise SystemExit(0)
+
+            fallback_query = sql.SQL("SELECT COUNT(*) FROM {table}").format(
+                table=sql.Identifier(table_name)
+            )
+            cursor.execute(fallback_query)
             value = cursor.fetchone()[0]
             print(max(int(value or 0), 0))
 except Exception:

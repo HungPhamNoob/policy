@@ -6,6 +6,19 @@ const nextConfig = {
     "maplibre-gl",
     "react-map-gl"
   ],
+  async headers() {
+    return [
+      {
+        source: "/:path*",
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "no-store, no-cache, max-age=0, must-revalidate"
+          }
+        ]
+      }
+    ];
+  },
   async rewrites() {
     const target = process.env.DASHBOARD_PROXY_TARGET || "http://localhost:8000";
     return [
