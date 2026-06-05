@@ -11,6 +11,9 @@ export const metadata: Metadata = {
   description: "Realtime road accident risk dashboard"
 };
 
+export const dynamic = "force-dynamic";
+export const fetchCache = "force-no-store";
+
 const EARLY_COMPATIBILITY_SCRIPT = `
 (() => {
   const API_BASE = "http://35.224.149.110:8000";
