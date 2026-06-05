@@ -1,9 +1,11 @@
 import type { MapMode, ScenarioInput } from "./types";
 
+export const DEFAULT_REMOTE_API_BASE_URL = "http://35.224.149.110:8000";
+
 export const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL ||
   process.env.VITE_API_BASE_URL ||
-  "";
+  DEFAULT_REMOTE_API_BASE_URL;
 
 type QueryValue = string | number | boolean | null | undefined;
 
@@ -14,8 +16,8 @@ function buildUrl(path: string, params?: Record<string, QueryValue>) {
       ? (window.location.hostname === "localhost" ||
           window.location.hostname === "127.0.0.1"
           ? "/api-proxy"
-          : `${window.location.protocol}//${window.location.hostname}:8000`)
-      : "http://localhost:3001/api-proxy");
+          : DEFAULT_REMOTE_API_BASE_URL)
+      : DEFAULT_REMOTE_API_BASE_URL);
   const resolvedBaseUrl = baseUrl.startsWith("http")
     ? baseUrl
     : typeof window !== "undefined"

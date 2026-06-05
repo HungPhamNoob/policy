@@ -1,10 +1,11 @@
 import { DashboardClient } from "@/components/DashboardClient";
+import { DEFAULT_REMOTE_API_BASE_URL } from "@/lib/api";
 import type { Hotspot, OverviewSummary, PredictionPoint } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 export const fetchCache = "force-no-store";
 
-const API_BASE = "http://35.224.149.110:8000";
+const API_BASE = DEFAULT_REMOTE_API_BASE_URL;
 
 async function loadJson<T>(path: string) {
   const response = await fetch(`${API_BASE}${path}`, {

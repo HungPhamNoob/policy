@@ -26,6 +26,10 @@ _RETRAIN_LOOP_CACHE_TTL_S = 30.0
 _REPLAY_PROGRESS_CACHE: dict[str, int] = {}
 
 
+def _clear_replay_progress_cache(table_name: str) -> None:
+    _REPLAY_PROGRESS_CACHE.pop(table_name, None)
+
+
 def _is_root_retrain_run(row: Any) -> bool:
     run_name = str(row.get("tags.mlflow.runName") or "")
     run_type_tag = str(row.get("tags.run_type") or "")
@@ -545,14 +549,15 @@ def _compute_retrain_loop_status(
         os.getenv("MIN_RETRAIN_BATCHES_BEFORE_FINISHED", "5")
     )
 
-    # Parse Airflow schedule window
-    schedule_str = os.getenv("AIRFLOW_MODEL_RETRAIN_SCHEDULE", "*/45 * * * *")
-    match = re.fullmatch(r"\*/(\d+)\s+\*\s+\*\s+\*\s+\*", schedule_str)
-    airflow_schedule_minutes = int(match.group(1)) if match else 45
+    # Prefer the explicit interval so dashboard text matches the actual DAG cadence.
+    airflow_schedule_minutes = int(
+        os.getenv("AIRFLOW_MODEL_RETRAIN_INTERVAL_MINUTES", "45") or "45"
+    )
     # Use 3x schedule window as the idle threshold while still reporting the real
     # Airflow cadence separately to the dashboard.
     idle_window_minutes = airflow_schedule_minutes * 3
     data_stale_window_seconds = idle_window_minutes * 60
+    replay_stall_window_seconds = min(15 * 60, max(10 * 60, airflow_schedule_minutes * 20))
 
     # Latest pipeline activity across ALL sources (prediction + tomtom).
     # For replay datasets, event_time is historical and should not be used to
@@ -614,6 +619,11 @@ def _compute_retrain_loop_status(
     tomtom_is_stale = False
     if latest_tomtom_time is not None:
         tomtom_is_stale = (now - latest_tomtom_time).total_seconds() > data_stale_window_seconds
+    prediction_is_short_stalled = False
+    if latest_prediction_time is not None:
+        prediction_is_short_stalled = (
+            now - latest_prediction_time
+        ).total_seconds() > replay_stall_window_seconds
 
     # BOTH streams must be stale for the system to be considered idle
     all_streams_stale = prediction_is_stale and (tomtom_is_stale or latest_tomtom_time is None)
@@ -683,7 +693,12 @@ def _compute_retrain_loop_status(
             f"{recent_finished_count} retrain batches completed successfully. "
             f"Latest event: {latest_event_time.isoformat() if latest_event_time else 'N/A'}."
         )
-    elif has_prediction_data and prediction_is_stale and latest_tomtom_time is not None and not tomtom_is_stale:
+    elif (
+        has_prediction_data
+        and prediction_is_short_stalled
+        and latest_tomtom_time is not None
+        and not tomtom_is_stale
+    ):
         loop_status = "stalled"
         loop_reason = (
             "US replay/prediction ingestion has stopped advancing while TomTom live traffic is still flowing. "
@@ -724,6 +739,7 @@ def _compute_retrain_loop_status(
         "mlflow_available": mlflow_available,
         "has_data": has_prediction_data,
         "prediction_is_stale": prediction_is_stale,
+        "prediction_is_short_stalled": prediction_is_short_stalled,
         "tomtom_is_stale": tomtom_is_stale,
         "recent_retrain_runs": recent_total_count,
         "recent_retrain_finished": recent_finished_count,
@@ -771,6 +787,9 @@ def replay_health() -> dict[str, Any]:
         stored_row_count = row_count
         compatibility_latest_event_time = latest_event_time
         compatibility_row_count = row_count
+        if table_name == settings.us_prediction_table.split(".")[-1] and row_count == 0:
+            latest_replay_row_index = None
+            _clear_replay_progress_cache(table_name)
         if latest_replay_row_index is not None:
             compatibility_row_count = latest_replay_row_index + 1
             compatibility_latest_event_time = latest_insert_time or latest_event_time

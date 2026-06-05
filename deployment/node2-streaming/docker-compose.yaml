@@ -528,8 +528,7 @@ services:
         chown -R flink:flink /opt/flink/tmp &&
         chmod -R 775 /opt/flink/checkpoints &&
         chmod -R 775 /opt/flink/tmp &&
-        /opt/flink/bin/flink run -d -m flink-jobmanager:8081 -pyclientexec /opt/flink/pyenv/bin/python -pyexec /opt/flink/pyenv/bin/python -pyfs processing -py processing/flink_streaming.py &&
-        tail -f /dev/null
+        bash deployment/node2-streaming/flink_job_guard.sh
       "
     environment:
       PYTHONPATH: /opt/traffic

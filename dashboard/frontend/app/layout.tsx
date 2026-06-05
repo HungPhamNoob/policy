@@ -15,7 +15,7 @@ export const fetchCache = "force-no-store";
 
 const EARLY_COMPATIBILITY_SCRIPT = `
 (() => {
-  const VERSION = "ui-20260605-0340";
+  const VERSION = "ui-20260605-0510";
   const ROUTE_VERSION_KEY = "trafficrisk_ui_route_version_once";
 
   function ensureVersionedLocation() {

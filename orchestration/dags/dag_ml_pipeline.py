@@ -23,11 +23,17 @@ default_args = {
     "retry_delay": timedelta(minutes=5),
 }
 
+RETRAIN_INTERVAL_MINUTES = int(
+    os.getenv("AIRFLOW_MODEL_RETRAIN_INTERVAL_MINUTES", "45")
+)
+
 with DAG(
     dag_id="model_retrain_hourly",
     default_args=default_args,
     description="H2O AutoML retraining every 45 min via internal SSH",
-    schedule_interval=os.getenv("AIRFLOW_MODEL_RETRAIN_SCHEDULE", "*/45 * * * *"),
+    # Use a real 45-minute cadence between scheduled runs. Cron `*/45 * * * *`
+    # only hits minute 0 and 45, which produces uneven 45/15 gaps in Airflow.
+    schedule_interval=timedelta(minutes=RETRAIN_INTERVAL_MINUTES),
     start_date=datetime(2026, 5, 1),
     catchup=False,
     max_active_runs=1,
@@ -39,7 +45,7 @@ with DAG(
         bash_command="""
             set -euo pipefail
             echo "=== [Airflow DAG] Launching Node3 retrain worker in background ==="
-            SSH_KEY_PATH="${SSH_KEY:-/run/secrets/google_compute_engine}"
+            SSH_KEY_PATH="${SSH_KEY:-/run/secrets/google_compute_engine/traffic-inter-node.key}"
             SSH_USER="${HUNG_SSH_USER:-runner}"
             NODE3_IP="${NODE3_INTERNAL_IP:-10.128.0.8}"
             if [ -d "${SSH_KEY_PATH}" ]; then
@@ -64,7 +70,9 @@ with DAG(
             echo "Using SSH key: ${SSH_KEY_PATH}"
             ssh -i "${SSH_KEY_PATH}" \
                 -o StrictHostKeyChecking=no \
-                -o ConnectTimeout=60 \
+                -o ConnectTimeout=20 \
+                -o ServerAliveInterval=15 \
+                -o ServerAliveCountMax=2 \
                 "${SSH_USER}@${NODE3_IP}" \
                 "cd /opt/traffic && bash scripts/gcp/launch-node3-retrain.sh"
 
@@ -72,7 +80,7 @@ with DAG(
         """,
         env={
             "HUNG_SSH_USER": "runner",
-            "SSH_KEY": "/run/secrets/google_compute_engine",
+            "SSH_KEY": "/run/secrets/google_compute_engine/traffic-inter-node.key",
             "NODE3_INTERNAL_IP": "10.128.0.8",
         },
         execution_timeout=timedelta(minutes=5),
@@ -83,7 +91,7 @@ with DAG(
         bash_command="""
             set -euo pipefail
             echo "=== [Airflow DAG] Reading Node3 retrain status ==="
-            SSH_KEY_PATH="${SSH_KEY:-/run/secrets/google_compute_engine}"
+            SSH_KEY_PATH="${SSH_KEY:-/run/secrets/google_compute_engine/traffic-inter-node.key}"
             SSH_USER="${HUNG_SSH_USER:-runner}"
             NODE3_IP="${NODE3_INTERNAL_IP:-10.128.0.8}"
             if [ -d "${SSH_KEY_PATH}" ]; then
@@ -126,7 +134,7 @@ PY
         """,
         env={
             "HUNG_SSH_USER": "runner",
-            "SSH_KEY": "/run/secrets/google_compute_engine",
+            "SSH_KEY": "/run/secrets/google_compute_engine/traffic-inter-node.key",
             "NODE3_INTERNAL_IP": "10.128.0.8",
         },
         execution_timeout=timedelta(minutes=5),

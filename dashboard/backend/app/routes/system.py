@@ -22,6 +22,11 @@ def get_system_status() -> dict:
         float(os.getenv("TOMTOM_FLUSH_INTERVAL_SECONDS", "15") or "15")
     )
     tomtom_live_status = "configured" if tomtom_api_key else "missing_credentials"
+    retrain_schedule_label = (
+        f"every {settings.airflow_model_retrain_interval_minutes} minutes"
+        if settings.airflow_model_retrain_interval_minutes > 0
+        else settings.airflow_model_retrain_schedule
+    )
     return {
         "environment": settings.environment,
         "kafka": {
@@ -59,7 +64,7 @@ def get_system_status() -> dict:
         },
         "airflow": {
             "executor": "LocalExecutor",
-            "model_retrain_schedule": settings.airflow_model_retrain_schedule,
+            "model_retrain_schedule": retrain_schedule_label,
             "stream_health_schedule": settings.airflow_stream_health_schedule,
         },
         "pipeline": {

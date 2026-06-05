@@ -32,6 +32,10 @@ OVERVIEW_RISK_SAMPLE_LIMIT = 5_000
 _REPLAY_PROGRESS_CACHE: dict[str, int] = {}
 
 
+def _clear_replay_progress_cache(table_key: str) -> None:
+    _REPLAY_PROGRESS_CACHE.pop(table_key, None)
+
+
 def _public_table_name(value: str) -> str:
     """Return the unqualified table name used by the public schema."""
     return value.split(".")[-1]
@@ -198,11 +202,15 @@ def _load_overview_source(
     latest_event_time = sample_row.get("latest_event_time") if sample_row else None
     replay_progress_events = None
     if table_name == get_settings().us_prediction_table:
-        latest_replay_row_index = _latest_processed_replay_row_index(
-            table_name=table_name, table=table
-        )
-        if latest_replay_row_index is not None:
-            replay_progress_events = latest_replay_row_index + 1
+        if total_events == 0:
+            _clear_replay_progress_cache(str(table))
+            replay_progress_events = 0
+        else:
+            latest_replay_row_index = _latest_processed_replay_row_index(
+                table_name=table_name, table=table
+            )
+            if latest_replay_row_index is not None:
+                replay_progress_events = latest_replay_row_index + 1
 
     return {
         "total_events": total_events,

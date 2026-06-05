@@ -32,7 +32,7 @@ const DASHBOARD_MAP_POINT_LIMITS: Record<MapMode, number> = {
   full: 1500
 };
 const DASHBOARD_LATEST_PREDICTIONS_LIMIT = 30;
-const UI_BUILD_TAG = "ui-20260605-0340";
+const UI_BUILD_TAG = "ui-20260605-0510";
 const displayEventId = (eventId: string) => eventId.split("@")[0] || eventId;
 const EMPTY_SUMMARY: OverviewSummary = {
   total_events: 0,
@@ -154,11 +154,15 @@ export function DashboardClient({ bootstrap }: { bootstrap: DashboardBootstrap }
     (replayHealth?.sources as Record<string, any>[] | undefined)?.find(
       (item) => String(item.table) === "traffic_risk_predictions"
     ) || {};
+  const latestReplayRowIndex = Number(
+    replayPredictionSource?.latest_replay_row_index ?? -1
+  );
   const points = (pointsQuery.data?.points as PredictionPoint[] | undefined) || [];
   const latest =
     (latestQuery.data?.predictions as PredictionPoint[] | undefined) || [];
   const replayProgressEvents = Number(
-    replayHealth?.row_count ??
+    (latestReplayRowIndex >= 0 ? latestReplayRowIndex + 1 : null) ??
+      replayHealth?.row_count ??
       replayPredictionSource?.row_count ??
       summary.replay_progress_events ??
       summary.total_events ??

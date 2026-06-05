@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
+import os
+import subprocess
 from typing import Any
 
 from app.core.config import get_settings
@@ -19,6 +22,15 @@ TRACKED_METRICS = [
     "weighted_f1",
     "logloss",
 ]
+ACTIVE_NODE3_PHASES = {
+    "starting",
+    "bootstrap",
+    "syncing_silver",
+    "spark",
+    "h2o",
+    "logging_models",
+    "registering_model",
+}
 
 
 def _coerce_int(value: Any) -> int | None:
@@ -150,6 +162,105 @@ def _leaderboard_child_payload(row: Any) -> dict[str, Any]:
     }
 
 
+def _active_node3_retrain_run() -> dict[str, Any] | None:
+    settings = get_settings()
+    ssh_key = str(os.getenv("SSH_KEY") or "/run/secrets/google_compute_engine").strip()
+    ssh_users = []
+    for candidate in (
+        os.getenv("SSH_USER"),
+        os.getenv("HUNG_SSH_USER"),
+        "runner",
+    ):
+        value = str(candidate or "").strip()
+        if value and value not in ssh_users:
+            ssh_users.append(value)
+    node3_host = str(os.getenv("NODE3_INTERNAL_IP") or "10.128.0.8").strip()
+    if not ssh_key or not os.path.exists(ssh_key) or not ssh_users or not node3_host:
+        return None
+
+    remote_script = r"""
+python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+status_path = Path('/opt/traffic/logs/retrain_state/node3-retrain-status.json')
+if not status_path.exists():
+    raise SystemExit(1)
+
+payload = json.loads(status_path.read_text(encoding='utf-8'))
+pid = int(payload.get('pid') or 0)
+running = False
+if pid > 0:
+    try:
+        os.kill(pid, 0)
+        running = True
+    except OSError:
+        running = False
+payload['running'] = running
+print(json.dumps(payload, ensure_ascii=True))
+PY
+""".strip()
+
+    try:
+        payload = None
+        for ssh_user in ssh_users:
+            try:
+                result = subprocess.run(
+                    [
+                        "ssh",
+                        "-i",
+                        ssh_key,
+                        "-o",
+                        "StrictHostKeyChecking=no",
+                        "-o",
+                        "ConnectTimeout=20",
+                        f"{ssh_user}@{node3_host}",
+                        remote_script,
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                payload = json.loads(result.stdout.strip())
+                break
+            except Exception:
+                continue
+        if payload is None:
+            return None
+    except Exception:
+        return None
+
+    if not payload.get("running"):
+        return None
+
+    phase = str(payload.get("phase") or "").strip().lower()
+    if phase not in ACTIVE_NODE3_PHASES:
+        return None
+
+    batch_id = _clean_value(payload.get("batch_id"))
+    started_at = _clean_value(payload.get("started_at"))
+    models_logged = _coerce_int(payload.get("models_logged")) or 0
+    return {
+        "run_id": f"node3-active-{batch_id or started_at or 'unknown'}",
+        "run_name": "h2o_retrain_online",
+        "status": "RUNNING",
+        "run_type": "retrain_online",
+        "run_role": "retrain_parent",
+        "retrain_batch_id": batch_id,
+        "expected_models": _coerce_int(os.getenv("H2O_TOP_K_MODELS")) or 10,
+        "models_logged": models_logged,
+        "is_complete_batch": False,
+        "start_time": started_at,
+        "end_time": None,
+        "metrics": {},
+        "leaderboard_models": [],
+        "phase": phase,
+        "message": _clean_value(payload.get("message")),
+    }
+
+
 def retrain_history(limit: int = 30) -> dict[str, Any]:
     """Return recent MLflow training runs with core classification metrics."""
     settings = get_settings()
@@ -223,6 +334,19 @@ def retrain_history(limit: int = 30) -> dict[str, Any]:
                 )
             )
             run["leaderboard_models"] = child_runs
+
+        active_run = _active_node3_retrain_run()
+        if active_run is not None:
+            duplicate_active = any(
+                str(run.get("status") or "").upper() == "RUNNING"
+                and (
+                    (run.get("retrain_batch_id") and run.get("retrain_batch_id") == active_run.get("retrain_batch_id"))
+                    or (run.get("start_time") and run.get("start_time") == active_run.get("start_time"))
+                )
+                for run in parent_runs
+            )
+            if not duplicate_active:
+                parent_runs.insert(0, active_run)
 
         output = _backfill_seed_runs(parent_runs, limit)
         for run in output:

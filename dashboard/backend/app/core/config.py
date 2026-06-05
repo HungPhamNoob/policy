@@ -57,6 +57,10 @@ class Settings(BaseSettings):
         default="*/45 * * * *",
         alias="AIRFLOW_MODEL_RETRAIN_SCHEDULE",
     )
+    airflow_model_retrain_interval_minutes: int = Field(
+        default=45,
+        alias="AIRFLOW_MODEL_RETRAIN_INTERVAL_MINUTES",
+    )
     airflow_stream_health_schedule: str = Field(
         default="*/2 * * * *",
         alias="AIRFLOW_STREAM_HEALTH_SCHEDULE",

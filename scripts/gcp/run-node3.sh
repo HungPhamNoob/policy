@@ -46,6 +46,7 @@ NODE3_LOCAL_PENDING_TOTAL_COUNT=0
 NODE3_CURRENT_BATCH_ID=""
 NODE3_REMOTE_PENDING_MANIFEST_COUNT=0
 NODE3_INCREMENTAL_BATCH_LIMIT="${NODE3_DELTA_BATCH_MAX_FILES:-${SPARK_INCREMENTAL_MAX_FILES:-10000}}"
+NODE3_H2O_WALL_TIMEOUT_SECONDS="${NODE3_H2O_WALL_TIMEOUT_SECONDS:-1800}"
 NODE3_STATUS_VALUE="failed"
 NODE3_STATUS_MESSAGE="Node 3 retrain did not complete."
 NODE3_STATUS_PHASE="initializing"
@@ -997,7 +998,9 @@ fi
 # Keep online retraining bounded so scheduled ticks (20 minutes) make progress without exhausting the VM.
 # Use a node3-specific heap default instead of the shared H2O_MAX_MEM value because the
 # cumulative online retrain dataset is materially larger than the offline/local defaults.
-H2O_MAX_RUNTIME="${NODE3_H2O_MAX_RUNTIME:-900}" \
+set +e
+env \
+  H2O_MAX_RUNTIME="${NODE3_H2O_MAX_RUNTIME:-900}" \
   H2O_MAX_MEM="${NODE3_H2O_MAX_MEM:-4G}" \
   H2O_NTHREADS="${NODE3_H2O_NTHREADS:-${H2O_NTHREADS:-2}}" \
   H2O_BALANCE_CLASSES="${NODE3_H2O_BALANCE_CLASSES:-${H2O_BALANCE_CLASSES:-false}}" \
@@ -1013,7 +1016,18 @@ H2O_MAX_RUNTIME="${NODE3_H2O_MAX_RUNTIME:-900}" \
   NODE3_STATUS_FILE="${NODE3_STATUS_FILE}" \
   RETRAIN_BATCH_ID="${NODE3_CURRENT_BATCH_ID}" \
   RETRAIN_DATA_PATH="${LOCAL_GOLD_RETRAIN_CSV_PATH}" \
+  timeout --signal=TERM --kill-after=60 "${NODE3_H2O_WALL_TIMEOUT_SECONDS}" \
   "${RETRAINING_PYTHON}" ml/training/h2o_after_2020.py
+retrain_exit_code=$?
+set -e
+if [ "${retrain_exit_code}" -ne 0 ]; then
+  if [ "${retrain_exit_code}" -eq 124 ]; then
+    NODE3_STATUS_PHASE="failed"
+    NODE3_STATUS_MESSAGE="H2O retraining exceeded the ${NODE3_H2O_WALL_TIMEOUT_SECONDS}s wall timeout."
+    write_node3_status "failed" "failed" "${NODE3_STATUS_MESSAGE}" "${NODE3_CURRENT_BATCH_ID}" "${NODE3_STATUS_MODELS_LOGGED}"
+  fi
+  exit "${retrain_exit_code}"
+fi
 
 NODE3_STATUS_MODELS_LOGGED="${NODE3_H2O_TOP_K_MODELS:-${H2O_TOP_K_MODELS:-10}}"
 

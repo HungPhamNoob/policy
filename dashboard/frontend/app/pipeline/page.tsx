@@ -18,8 +18,8 @@ import { formatVietnamTimestamp, formatVietnamTimestampLabel } from "@/lib/time"
 import { KpiCard } from "@/components/DataState";
 
 type AnyRecord = Record<string, any>;
-const UI_BUILD_TAG = "ui-20260605-0340";
-const NAV_BUILD_VERSION = "ui-20260605-0340";
+const UI_BUILD_TAG = "ui-20260605-0510";
+const NAV_BUILD_VERSION = "ui-20260605-0510";
 
 const SERVICE_URLS: Record<string, string> = {
   kafka: "",
