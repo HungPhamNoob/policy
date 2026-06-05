@@ -75,7 +75,7 @@ services:
       - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
       - AIRFLOW_MODEL_RETRAIN_SCHEDULE=${AIRFLOW_MODEL_RETRAIN_SCHEDULE:-*/45 * * * *}
       - AIRFLOW_STREAM_HEALTH_SCHEDULE=${AIRFLOW_STREAM_HEALTH_SCHEDULE:-*/2 * * * *}
-      - SSH_KEY=/run/secrets/google_compute_engine
+      - SSH_KEY=/opt/airflow/.ssh/traffic-inter-node.key
       - HUNG_SSH_USER=${HUNG_SSH_USER:-runner}
       - NODE2_INTERNAL_IP=${NODE2_INTERNAL_IP:-10.128.0.9}
       - NODE3_INTERNAL_IP=${NODE3_INTERNAL_IP:-10.128.0.8}
@@ -92,6 +92,17 @@ services:
       bash -c "
         set -euo pipefail;
         export PATH=/home/airflow/.local/bin:$$PATH;
+        mkdir -p /opt/airflow/.ssh;
+        if [ -f /run/secrets/google_compute_engine ]; then
+          cp /run/secrets/google_compute_engine /opt/airflow/.ssh/traffic-inter-node.key;
+        elif [ -f /run/secrets/google_compute_engine/traffic-inter-node.key ]; then
+          cp /run/secrets/google_compute_engine/traffic-inter-node.key /opt/airflow/.ssh/traffic-inter-node.key;
+        elif [ -f /run/secrets/google_compute_engine/google_compute_engine ]; then
+          cp /run/secrets/google_compute_engine/google_compute_engine /opt/airflow/.ssh/traffic-inter-node.key;
+        fi;
+        chown -R airflow:root /opt/airflow/.ssh;
+        chmod 700 /opt/airflow/.ssh;
+        test ! -f /opt/airflow/.ssh/traffic-inter-node.key || chmod 600 /opt/airflow/.ssh/traffic-inter-node.key;
         airflow db migrate || airflow db init;
         airflow users create --username $${AIRFLOW_USER:-admin} --password $${AIRFLOW_PASSWORD:-admin} --firstname Admin --lastname User --role Admin --email admin@local 2>/dev/null || true;
         exec airflow webserver -p 8080
@@ -134,7 +145,7 @@ services:
       - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS:-}
       - AIRFLOW_MODEL_RETRAIN_SCHEDULE=${AIRFLOW_MODEL_RETRAIN_SCHEDULE:-*/45 * * * *}
       - AIRFLOW_STREAM_HEALTH_SCHEDULE=${AIRFLOW_STREAM_HEALTH_SCHEDULE:-*/2 * * * *}
-      - SSH_KEY=/run/secrets/google_compute_engine
+      - SSH_KEY=/opt/airflow/.ssh/traffic-inter-node.key
       - HUNG_SSH_USER=${HUNG_SSH_USER:-runner}
       - NODE2_INTERNAL_IP=${NODE2_INTERNAL_IP:-10.128.0.9}
       - NODE3_INTERNAL_IP=${NODE3_INTERNAL_IP:-10.128.0.8}
@@ -149,6 +160,17 @@ services:
       bash -c "
         set -euo pipefail;
         export PATH=/home/airflow/.local/bin:$$PATH;
+        mkdir -p /opt/airflow/.ssh;
+        if [ -f /run/secrets/google_compute_engine ]; then
+          cp /run/secrets/google_compute_engine /opt/airflow/.ssh/traffic-inter-node.key;
+        elif [ -f /run/secrets/google_compute_engine/traffic-inter-node.key ]; then
+          cp /run/secrets/google_compute_engine/traffic-inter-node.key /opt/airflow/.ssh/traffic-inter-node.key;
+        elif [ -f /run/secrets/google_compute_engine/google_compute_engine ]; then
+          cp /run/secrets/google_compute_engine/google_compute_engine /opt/airflow/.ssh/traffic-inter-node.key;
+        fi;
+        chown -R airflow:root /opt/airflow/.ssh;
+        chmod 700 /opt/airflow/.ssh;
+        test ! -f /opt/airflow/.ssh/traffic-inter-node.key || chmod 600 /opt/airflow/.ssh/traffic-inter-node.key;
         airflow db migrate || airflow db init;
         airflow users create --username $${AIRFLOW_USER:-admin} --password $${AIRFLOW_PASSWORD:-admin} --firstname Admin --lastname User --role Admin --email admin@local 2>/dev/null || true;
         exec airflow scheduler
