@@ -131,6 +131,53 @@ def _backfill_seed_runs(output: list[dict[str, Any]], limit: int) -> list[dict[s
     return output
 
 
+def _normalize_retrain_run(run: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(run)
+    if normalized.get("end_time") in {"NaT", "nat", ""}:
+        normalized["end_time"] = None
+    if normalized.get("start_time") in {"NaT", "nat", ""}:
+        normalized["start_time"] = None
+
+    leaderboard_models = list(normalized.get("leaderboard_models") or [])
+    normalized["leaderboard_models"] = leaderboard_models
+    child_count = len(leaderboard_models)
+    if normalized.get("models_logged") is None:
+        normalized["models_logged"] = child_count if child_count > 0 else 0
+    if child_count <= 0:
+        return normalized
+
+    expected_models = normalized.get("expected_models")
+    if expected_models is None:
+        expected_models = child_count
+    logged_models = max(
+        child_count,
+        int(normalized.get("models_logged") or 0),
+    )
+
+    normalized["expected_models"] = expected_models
+    normalized["models_logged"] = logged_models
+    normalized["is_complete_batch"] = (
+        str(normalized.get("status") or "").upper() == "FINISHED"
+        and logged_models >= int(expected_models or 0)
+    )
+    if not normalized.get("metrics") and leaderboard_models:
+        normalized["metrics"] = dict(leaderboard_models[0].get("metrics") or {})
+    return normalized
+
+
+def _dedupe_retrain_runs_by_batch(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen_run_ids: set[str] = set()
+    for run in runs:
+        run_id = str(run.get("run_id") or "").strip()
+        if run_id and run_id in seen_run_ids:
+            continue
+        deduped.append(run)
+        if run_id:
+            seen_run_ids.add(run_id)
+    return deduped
+
+
 def _leaderboard_child_payload(row: Any) -> dict[str, Any]:
     metrics = {
         metric: _clean_value(row.get(f"metrics.{metric}"))
@@ -141,6 +188,8 @@ def _leaderboard_child_payload(row: Any) -> dict[str, Any]:
         "run_id": _clean_value(row.get("run_id")),
         "run_name": _clean_value(row.get("tags.mlflow.runName")),
         "status": _clean_value(row.get("status")),
+        "retrain_batch_id": _clean_value(row.get("tags.retrain_batch_id"))
+        or _clean_value(row.get("params.retrain_batch_id")),
         "rank": _coerce_int(row.get("params.rank") or row.get("tags.rank")),
         "model_id": _clean_value(row.get("params.model_id"))
         or _clean_value(row.get("tags.model_id")),
@@ -160,6 +209,29 @@ def _leaderboard_child_payload(row: Any) -> dict[str, Any]:
         ),
         "metrics": metrics,
     }
+
+
+def _reconcile_parent_runs_by_batch(
+    parent_runs: list[dict[str, Any]],
+    leaderboard_children: dict[str, list[dict[str, Any]]],
+) -> None:
+    for run in parent_runs:
+        current_children = run.get("leaderboard_models") or []
+        if current_children:
+            existing_expected = run.get("expected_models")
+            inferred_expected = existing_expected or len(current_children)
+            inferred_logged = max(
+                len(current_children),
+                int(run.get("models_logged") or 0),
+            )
+            run["expected_models"] = inferred_expected
+            run["models_logged"] = inferred_logged
+            run["is_complete_batch"] = (
+                str(run.get("status") or "").upper() == "FINISHED"
+                and inferred_logged >= int(inferred_expected or 0)
+            )
+            if not run.get("metrics"):
+                run["metrics"] = dict(current_children[0].get("metrics") or {})
 
 
 def _active_node3_retrain_run() -> dict[str, Any] | None:
@@ -335,6 +407,30 @@ def retrain_history(limit: int = 30) -> dict[str, Any]:
             )
             run["leaderboard_models"] = child_runs
 
+        _reconcile_parent_runs_by_batch(parent_runs, leaderboard_children)
+
+        for run in parent_runs:
+            child_count = len(run.get("leaderboard_models") or [])
+            if child_count <= 0:
+                continue
+            expected_models = run.get("expected_models")
+            if expected_models is None:
+                expected_models = child_count
+                run["expected_models"] = expected_models
+            logged_models = max(
+                child_count,
+                int(run.get("models_logged") or 0),
+            )
+            run["models_logged"] = logged_models
+            run["is_complete_batch"] = (
+                str(run.get("status") or "").upper() == "FINISHED"
+                and logged_models >= int(expected_models or 0)
+            )
+            if not run.get("metrics"):
+                first_child = (run.get("leaderboard_models") or [None])[0]
+                if first_child:
+                    run["metrics"] = dict(first_child.get("metrics") or {})
+
         active_run = _active_node3_retrain_run()
         if active_run is not None:
             duplicate_active = any(
@@ -348,17 +444,19 @@ def retrain_history(limit: int = 30) -> dict[str, Any]:
             if not duplicate_active:
                 parent_runs.insert(0, active_run)
 
-        output = _backfill_seed_runs(parent_runs, limit)
-        for run in output:
-            run.setdefault("leaderboard_models", [])
+        parent_runs = _dedupe_retrain_runs_by_batch(parent_runs)
+
+        runs_for_output = parent_runs if parent_runs else _backfill_seed_runs([], limit)
+        output = [
+            _normalize_retrain_run(run)
+            for run in runs_for_output
+        ]
         return {
             "status": "ok" if output else "not_enough_data",
             "experiment": settings.mlflow_experiment_name,
             "runs": output,
             "metrics": TRACKED_METRICS,
-            "source": "mlflow_with_seed_backfill"
-            if len(output) > len(parent_runs)
-            else "mlflow",
+            "source": "seed_fallback" if not parent_runs and output else "mlflow",
         }
     except Exception as exc:
         fallback = _seed_history(limit, settings.mlflow_experiment_name)

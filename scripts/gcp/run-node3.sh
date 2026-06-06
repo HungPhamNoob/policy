@@ -12,6 +12,13 @@ PROJECT_ROOT="${PROJECT_ROOT:-/opt/traffic}"
 ENV_FILE="${ENV_FILE:-${PROJECT_ROOT}/.env.cloud}"
 NODE3_COMPOSE_FILE="${PROJECT_ROOT}/deployment/node3-batch/docker-compose.yaml"
 NODE3_COMPOSE_DIR="$(dirname "${NODE3_COMPOSE_FILE}")"
+NODE3_SPARK_WORKER_COUNT="${NODE3_SPARK_WORKER_COUNT:-2}"
+NODE3_SPARK_WORKER_MEMORY="${NODE3_SPARK_WORKER_MEMORY:-1536m}"
+NODE3_SPARK_DRIVER_MEMORY="${NODE3_SPARK_DRIVER_MEMORY:-1280m}"
+ACTIVE_SPARK_SERVICES=(spark-master spark-worker-1 spark-worker-2)
+if [ "${NODE3_SPARK_WORKER_COUNT}" -ge 3 ]; then
+  ACTIVE_SPARK_SERVICES+=(spark-worker-3)
+fi
 NODE3_WAIT_FOR_SILVER_SECONDS="${NODE3_WAIT_FOR_SILVER_SECONDS:-600}"
 NODE3_WAIT_FOR_SILVER_INTERVAL_SECONDS="${NODE3_WAIT_FOR_SILVER_INTERVAL_SECONDS:-15}"
 NODE3_MIN_SILVER_OBJECTS="${NODE3_MIN_SILVER_OBJECTS:-100}"
@@ -44,15 +51,18 @@ NODE3_STOP_SPARK_FOR_H2O="${NODE3_STOP_SPARK_FOR_H2O:-true}"
 NODE3_LOCAL_PENDING_DELTA_COUNT=0
 NODE3_LOCAL_PENDING_TOTAL_COUNT=0
 NODE3_CURRENT_BATCH_ID=""
+NODE3_SOURCE_WATERMARK=""
 NODE3_REMOTE_PENDING_MANIFEST_COUNT=0
 NODE3_INCREMENTAL_BATCH_LIMIT="${NODE3_DELTA_BATCH_MAX_FILES:-${SPARK_INCREMENTAL_MAX_FILES:-10000}}"
-NODE3_H2O_WALL_TIMEOUT_SECONDS="${NODE3_H2O_WALL_TIMEOUT_SECONDS:-1800}"
+NODE3_H2O_WALL_TIMEOUT_SECONDS="${NODE3_H2O_WALL_TIMEOUT_SECONDS:-3600}"
 NODE3_STATUS_VALUE="failed"
 NODE3_STATUS_MESSAGE="Node 3 retrain did not complete."
 NODE3_STATUS_PHASE="initializing"
 NODE3_STATUS_MODELS_LOGGED=0
 NODE3_STATUS_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 NODE3_STATUS_UPDATED_AT="${NODE3_STATUS_STARTED_AT}"
+NODE3_STATUS_HEARTBEAT_PID=""
+NODE3_STATUS_HEARTBEAT_INTERVAL_SECONDS="${NODE3_STATUS_HEARTBEAT_INTERVAL_SECONDS:-25}"
 
 ensure_path_writable() {
   local target_path="$1"
@@ -118,6 +128,92 @@ with open(sys.argv[1], "w", encoding="utf-8") as handle:
 PY
 }
 
+stop_node3_status_heartbeat() {
+  if [ -n "${NODE3_STATUS_HEARTBEAT_PID}" ] && kill -0 "${NODE3_STATUS_HEARTBEAT_PID}" 2>/dev/null; then
+    kill "${NODE3_STATUS_HEARTBEAT_PID}" 2>/dev/null || true
+    wait "${NODE3_STATUS_HEARTBEAT_PID}" 2>/dev/null || true
+  fi
+  NODE3_STATUS_HEARTBEAT_PID=""
+}
+
+start_node3_status_heartbeat() {
+  local phase="${1:-${NODE3_STATUS_PHASE}}"
+  local message="${2:-${NODE3_STATUS_MESSAGE}}"
+  local batch_id="${3:-${NODE3_CURRENT_BATCH_ID}}"
+  local models_logged="${4:-${NODE3_STATUS_MODELS_LOGGED}}"
+
+  stop_node3_status_heartbeat
+  (
+    while true; do
+      sleep "${NODE3_STATUS_HEARTBEAT_INTERVAL_SECONDS}" || exit 0
+      write_node3_status "continue" "${phase}" "${message}" "${batch_id}" "${models_logged}"
+    done
+  ) &
+  NODE3_STATUS_HEARTBEAT_PID=$!
+}
+
+terminate_running_mlflow_retrain_runs() {
+  local failure_status="${1:-FAILED}"
+  local batch_id="${2:-${NODE3_CURRENT_BATCH_ID}}"
+  local tracking_uri="${MLFLOW_TRACKING_URI:-}"
+  local experiment_name="${MLFLOW_EXPERIMENT_NAME:-traffic-risk-assessment}"
+
+  if [ -z "${tracking_uri}" ]; then
+    echo "Skipping MLflow cleanup because MLFLOW_TRACKING_URI is not set."
+    return 0
+  fi
+
+  echo "Closing stale MLflow retrain runs for batch ${batch_id:-<unknown>} with status ${failure_status}."
+  MLFLOW_TRACKING_URI="${tracking_uri}" \
+  MLFLOW_EXPERIMENT_NAME="${experiment_name}" \
+  RETRAIN_BATCH_ID="${batch_id}" \
+  RETRAIN_FAILURE_STATUS="${failure_status}" \
+  "${RETRAINING_PYTHON:-python3}" - <<'PY'
+import os
+
+from mlflow.tracking import MlflowClient
+
+tracking_uri = os.environ["MLFLOW_TRACKING_URI"]
+experiment_name = os.environ.get("MLFLOW_EXPERIMENT_NAME", "traffic-risk-assessment")
+batch_id = os.environ.get("RETRAIN_BATCH_ID", "").strip()
+failure_status = os.environ.get("RETRAIN_FAILURE_STATUS", "FAILED").upper()
+
+client = MlflowClient(tracking_uri=tracking_uri)
+experiment = client.get_experiment_by_name(experiment_name)
+if experiment is None:
+    print(f"MLflow experiment not found: {experiment_name}")
+    raise SystemExit(0)
+
+filter_parts = [
+    "attributes.status = 'RUNNING'",
+    "tags.run_type = 'retrain_online'",
+]
+if batch_id:
+    filter_parts.append(f"tags.retrain_batch_id = '{batch_id}'")
+
+runs = client.search_runs(
+    experiment_ids=[experiment.experiment_id],
+    filter_string=" and ".join(filter_parts),
+    max_results=50,
+    order_by=["attribute.start_time DESC"],
+)
+
+terminated = 0
+for run in runs:
+    run_role = run.data.tags.get("run_role", "")
+    if run_role not in {"retrain_parent", "leaderboard_model"}:
+        continue
+    client.set_terminated(run.info.run_id, status=failure_status)
+    print(
+        f"Marked MLflow run {run.info.run_id} ({run.info.run_name}, role={run_role}) as {failure_status}."
+    )
+    terminated += 1
+
+if terminated == 0:
+    print("No stale RUNNING MLflow retrain runs required cleanup.")
+PY
+}
+
 cleanup_background_pid() {
   if [ -f "${NODE3_BACKGROUND_PID_FILE}" ]; then
     local recorded_pid
@@ -129,6 +225,7 @@ cleanup_background_pid() {
 }
 
 release_node3_lock() {
+  stop_node3_status_heartbeat
   if [ "${NODE3_LOCK_OWNED}" -eq 1 ]; then
     rm -rf "${NODE3_LOCK_DIR}" 2>/dev/null || sudo rm -rf "${NODE3_LOCK_DIR}" 2>/dev/null || true
   fi
@@ -530,7 +627,7 @@ mark_silver_watermark_processed() {
 
 stop_stale_h2o_processes() {
   local stale_h2o_pids
-  stale_h2o_pids="$(pgrep -f '/h2o\\.jar' || true)"
+  stale_h2o_pids="$(pgrep -f 'h2o\\.jar' || true)"
   if [ -z "${stale_h2o_pids}" ]; then
     echo "No stale H2O JVMs detected before retraining."
     return 0
@@ -540,7 +637,7 @@ stop_stale_h2o_processes() {
   sudo kill ${stale_h2o_pids} 2>/dev/null || true
   sleep 5
 
-  stale_h2o_pids="$(pgrep -f '/h2o\\.jar' || true)"
+  stale_h2o_pids="$(pgrep -f 'h2o\\.jar' || true)"
   if [ -n "${stale_h2o_pids}" ]; then
     echo "Force-stopping stubborn H2O JVMs: ${stale_h2o_pids}"
     sudo kill -9 ${stale_h2o_pids} 2>/dev/null || true
@@ -732,11 +829,27 @@ docker rm -f \
 echo "Ensuring the shared Docker network exists before Compose starts."
 docker network inspect capstone-net >/dev/null 2>&1 || docker network create capstone-net >/dev/null
 
+export SPARK_WORKER_MEMORY="${NODE3_SPARK_WORKER_MEMORY}"
+export SPARK_DRIVER_MEMORY="${NODE3_SPARK_DRIVER_MEMORY}"
+echo "Node3 Spark worker count for retrain: ${NODE3_SPARK_WORKER_COUNT}"
+echo "Node3 Spark worker memory for retrain: ${SPARK_WORKER_MEMORY}"
+echo "Node3 Spark driver memory for retrain: ${SPARK_DRIVER_MEMORY}"
+
 compose_cmd \
   --project-directory "${NODE3_COMPOSE_DIR}" \
   --env-file "${ENV_FILE}" \
   -f "${NODE3_COMPOSE_FILE}" \
-  up -d
+  up -d "${ACTIVE_SPARK_SERVICES[@]}"
+
+if [ "${NODE3_SPARK_WORKER_COUNT}" -lt 3 ]; then
+  echo "Ensuring spark-worker-3 stays offline for the lighter Node 3 retrain profile."
+  compose_cmd \
+    --project-directory "${NODE3_COMPOSE_DIR}" \
+    --env-file "${ENV_FILE}" \
+    -f "${NODE3_COMPOSE_FILE}" \
+    stop spark-worker-3 >/dev/null 2>&1 || true
+  docker rm -f node3-spark-worker-3 >/dev/null 2>&1 || true
+fi
 
 echo "Verifying that the Spark master container is mounted from ${PROJECT_ROOT}."
 SPARK_MOUNT_SOURCE="$(docker inspect node3-spark-master --format '{{range .Mounts}}{{if eq .Destination "/opt/traffic"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || true)"
@@ -780,6 +893,7 @@ export NODE3_LAST_SUCCESSFUL_SILVER_WATERMARK_FILE
 
 wait_for_silver_data
 write_node3_status "continue" "syncing_silver" "Silver data is visible. Syncing incremental Silver snapshot to local disk."
+start_node3_status_heartbeat "syncing_silver" "Silver data is visible. Syncing incremental Silver snapshot to local disk."
 
 ensure_path_writable "${LOCAL_CLOUD_DATA_DIR}"
 ensure_path_writable "${LOCAL_SILVER_FEATURES_PATH}"
@@ -835,12 +949,14 @@ if [ "${NODE3_LOCAL_PENDING_DELTA_COUNT}" -eq 0 ]; then
 fi
 
 if [ -s "${NODE3_CURRENT_SILVER_WATERMARK_FILE}" ]; then
-  NODE3_CURRENT_BATCH_ID="$(tr -d ' \n\r' < "${NODE3_CURRENT_SILVER_WATERMARK_FILE}")"
-else
-  NODE3_CURRENT_BATCH_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+  NODE3_SOURCE_WATERMARK="$(tr -d ' \n\r' < "${NODE3_CURRENT_SILVER_WATERMARK_FILE}")"
 fi
+NODE3_CURRENT_BATCH_ID="$(date -u +%Y%m%dT%H%M%S%6NZ)"
 echo "Current retrain batch ID: ${NODE3_CURRENT_BATCH_ID}"
-write_node3_status "continue" "batch_selected" "Selected a new retrain batch from Silver and will run Spark plus H2O." "${NODE3_CURRENT_BATCH_ID}"
+if [ -n "${NODE3_SOURCE_WATERMARK}" ]; then
+  echo "Source Silver watermark for this retrain: ${NODE3_SOURCE_WATERMARK}"
+fi
+write_node3_status "continue" "batch_selected" "Selected a new retrain run id from the current Silver snapshot and will run Spark plus H2O." "${NODE3_CURRENT_BATCH_ID}"
 
 LOCAL_SILVER_SAMPLE_FILE="$(find "${LOCAL_SILVER_FEATURES_PATH}" -type f -print -quit)"
 if [ -z "${LOCAL_SILVER_SAMPLE_FILE}" ]; then
@@ -871,6 +987,7 @@ ensure_path_container_writable "${CURRENT_BATCH_CSV_PATH}"
 
 echo "Running Spark silver-to-gold job once. Existing checkpoints/data are preserved."
 write_node3_status "continue" "spark" "Running Spark Silver-to-Gold job for the current retrain batch." "${NODE3_CURRENT_BATCH_ID}"
+start_node3_status_heartbeat "spark" "Running Spark Silver-to-Gold job for the current retrain batch." "${NODE3_CURRENT_BATCH_ID}"
 compose_cmd \
   --project-directory "${NODE3_COMPOSE_DIR}" \
   --env-file "${ENV_FILE}" \
@@ -900,6 +1017,7 @@ compose_cmd \
 echo "Syncing Gold Parquet and CSV outputs back to GCS."
 gcloud storage rsync -r "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}" "${GOLD_RETRAIN_PARQUET_PATH}"
 gcloud storage rsync -r "${LOCAL_GOLD_RETRAIN_CSV_PATH}" "${GOLD_RETRAIN_CSV_PATH}"
+stop_node3_status_heartbeat
 stop_spark_services_for_h2o
 
 echo "Running online H2O retraining once from the latest gold data."
@@ -1000,21 +1118,24 @@ fi
 # cumulative online retrain dataset is materially larger than the offline/local defaults.
 set +e
 env \
-  H2O_MAX_RUNTIME="${NODE3_H2O_MAX_RUNTIME:-900}" \
-  H2O_MAX_MEM="${NODE3_H2O_MAX_MEM:-4G}" \
-  H2O_NTHREADS="${NODE3_H2O_NTHREADS:-${H2O_NTHREADS:-2}}" \
-  H2O_BALANCE_CLASSES="${NODE3_H2O_BALANCE_CLASSES:-${H2O_BALANCE_CLASSES:-false}}" \
-  H2O_TRAIN_MAX_ROWS="${NODE3_H2O_TRAIN_MAX_ROWS:-${H2O_TRAIN_MAX_ROWS:-300000}}" \
-  H2O_EVAL_MAX_ROWS="${NODE3_H2O_EVAL_MAX_ROWS:-${H2O_EVAL_MAX_ROWS:-25000}}" \
-  H2O_MAX_AFTER_BALANCE_SIZE="${NODE3_H2O_MAX_AFTER_BALANCE_SIZE:-${H2O_MAX_AFTER_BALANCE_SIZE:-1.0}}" \
-  H2O_MAX_RUNTIME_SECS_PER_MODEL="${NODE3_H2O_MAX_RUNTIME_SECS_PER_MODEL:-${H2O_MAX_RUNTIME_SECS_PER_MODEL:-60}}" \
-  H2O_FALLBACK_PER_MODEL_RUNTIME_SECS="${NODE3_H2O_FALLBACK_PER_MODEL_RUNTIME_SECS:-${H2O_FALLBACK_PER_MODEL_RUNTIME_SECS:-25}}" \
+  H2O_MAX_RUNTIME="${NODE3_H2O_MAX_RUNTIME:-720}" \
+  H2O_MAX_MEM="${NODE3_H2O_MAX_MEM:-3G}" \
+  H2O_NTHREADS="${NODE3_H2O_NTHREADS:-2}" \
+  H2O_BALANCE_CLASSES="${NODE3_H2O_BALANCE_CLASSES:-false}" \
+  H2O_TRAIN_MAX_ROWS="${NODE3_H2O_TRAIN_MAX_ROWS:-250000}" \
+  H2O_EVAL_MAX_ROWS="${NODE3_H2O_EVAL_MAX_ROWS:-20000}" \
+  H2O_PREIMPORT_SAMPLE_ROWS="${NODE3_H2O_PREIMPORT_SAMPLE_ROWS:-312500}" \
+  H2O_PREIMPORT_SAMPLE_CHUNK_ROWS="${NODE3_H2O_PREIMPORT_SAMPLE_CHUNK_ROWS:-100000}" \
+  H2O_MAX_AFTER_BALANCE_SIZE="${NODE3_H2O_MAX_AFTER_BALANCE_SIZE:-1.0}" \
+  H2O_MAX_RUNTIME_SECS_PER_MODEL="${NODE3_H2O_MAX_RUNTIME_SECS_PER_MODEL:-60}" \
+  H2O_FALLBACK_PER_MODEL_RUNTIME_SECS="${NODE3_H2O_FALLBACK_PER_MODEL_RUNTIME_SECS:-25}" \
   H2O_NFOLDS="${NODE3_H2O_NFOLDS:-${H2O_NFOLDS:-0}}" \
-  H2O_EXCLUDE_ALGOS="${NODE3_H2O_EXCLUDE_ALGOS:-${H2O_EXCLUDE_ALGOS:-DeepLearning,StackedEnsemble,XGBoost}}" \
-  H2O_TOP_K_MODELS="${NODE3_H2O_TOP_K_MODELS:-${H2O_TOP_K_MODELS:-10}}" \
-  H2O_MAX_MODELS="${NODE3_H2O_MAX_MODELS:-${H2O_MAX_MODELS:-4}}" \
+  H2O_EXCLUDE_ALGOS="${NODE3_H2O_EXCLUDE_ALGOS:-${H2O_EXCLUDE_ALGOS:-DeepLearning}}" \
+  H2O_TOP_K_MODELS="${NODE3_H2O_TOP_K_MODELS:-10}" \
+  H2O_MAX_MODELS="${NODE3_H2O_MAX_MODELS:-${NODE3_H2O_TOP_K_MODELS:-10}}" \
   NODE3_STATUS_FILE="${NODE3_STATUS_FILE}" \
   RETRAIN_BATCH_ID="${NODE3_CURRENT_BATCH_ID}" \
+  RETRAIN_SOURCE_WATERMARK="${NODE3_SOURCE_WATERMARK}" \
   RETRAIN_DATA_PATH="${LOCAL_GOLD_RETRAIN_CSV_PATH}" \
   timeout --signal=TERM --kill-after=60 "${NODE3_H2O_WALL_TIMEOUT_SECONDS}" \
   "${RETRAINING_PYTHON}" ml/training/h2o_after_2020.py
@@ -1026,6 +1147,7 @@ if [ "${retrain_exit_code}" -ne 0 ]; then
     NODE3_STATUS_MESSAGE="H2O retraining exceeded the ${NODE3_H2O_WALL_TIMEOUT_SECONDS}s wall timeout."
     write_node3_status "failed" "failed" "${NODE3_STATUS_MESSAGE}" "${NODE3_CURRENT_BATCH_ID}" "${NODE3_STATUS_MODELS_LOGGED}"
   fi
+  terminate_running_mlflow_retrain_runs "FAILED" "${NODE3_CURRENT_BATCH_ID}"
   exit "${retrain_exit_code}"
 fi
 
