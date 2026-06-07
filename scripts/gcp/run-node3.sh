@@ -75,6 +75,19 @@ ensure_path_writable() {
   sudo chmod u+rwX,g+rwX "${target_path}"
 }
 
+ensure_path_shared_runtime_state() {
+  local target_path="$1"
+  if [ -z "${target_path}" ]; then
+    return 0
+  fi
+
+  ensure_path_writable "${target_path}"
+  # Retrain may be launched by the VM login user during debugging or by the
+  # Airflow/runner user on scheduled ticks. Keep the shared state files writable
+  # across both entry points so status and PID handoff remain reliable.
+  sudo chmod a+rwX "${target_path}"
+}
+
 ensure_path_container_writable() {
   local target_path="$1"
   if [ -z "${target_path}" ]; then
@@ -293,7 +306,7 @@ echo "Project root: ${PROJECT_ROOT}"
 echo "Environment file: ${ENV_FILE}"
 
 ensure_path_writable "${NODE3_LOG_DIR}"
-ensure_path_writable "${NODE3_STATE_DIR}"
+ensure_path_shared_runtime_state "${NODE3_STATE_DIR}"
 for state_file in \
   "${NODE3_STATUS_FILE}" \
   "${NODE3_LAUNCH_METADATA_FILE}" \
