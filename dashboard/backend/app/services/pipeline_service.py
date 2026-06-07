@@ -551,7 +551,7 @@ def _compute_retrain_loop_status(
 
     # Prefer the explicit interval so dashboard text matches the actual DAG cadence.
     airflow_schedule_minutes = int(
-        os.getenv("AIRFLOW_MODEL_RETRAIN_INTERVAL_MINUTES", "45") or "45"
+        os.getenv("AIRFLOW_MODEL_RETRAIN_INTERVAL_MINUTES", "60") or "60"
     )
     # Use 3x schedule window as the idle threshold while still reporting the real
     # Airflow cadence separately to the dashboard.
@@ -628,39 +628,35 @@ def _compute_retrain_loop_status(
     # BOTH streams must be stale for the system to be considered idle
     all_streams_stale = prediction_is_stale and (tomtom_is_stale or latest_tomtom_time is None)
 
-    # Count MLflow retrain runs (cached)
+    # Count retrain runs using the dashboard's reconciled MLflow history so
+    # orphaned child runs from a partially closed parent do not poison the
+    # pipeline status.
     recent_failed = False
     recent_incomplete = False
     recent_finished_count = 0
     recent_total_count = 0
     mlflow_available = False
     try:
-        import mlflow
-        mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
-        experiment = mlflow.get_experiment_by_name(settings.mlflow_experiment_name)
-        if experiment is not None:
-            runs = mlflow.search_runs(
-                experiment_ids=[experiment.experiment_id],
-                max_results=100,
-                order_by=["start_time DESC"],
-            )
-            latest_root_status = None
-            for _, row in runs.iterrows():
-                if not _is_root_retrain_run(row):
-                    continue
-                recent_total_count += 1
-                if latest_root_status is None:
-                    latest_root_status = str(row.get("status", "")).upper()
-                    if latest_root_status == "FAILED":
-                        recent_failed = True
-                    elif latest_root_status == "FINISHED" and not _root_run_is_complete(
-                        row
-                    ):
-                        recent_incomplete = True
-                status = str(row.get("status", "")).upper()
-                if status == "FINISHED" and _root_run_is_complete(row):
-                    recent_finished_count += 1
-            mlflow_available = True
+        from app.services.model_service import retrain_history
+
+        history = retrain_history(limit=30)
+        runs = history.get("runs") or []
+        latest_root_status = None
+        for run in runs:
+            if str(run.get("run_role") or "") != "retrain_parent":
+                continue
+            recent_total_count += 1
+            status = str(run.get("status") or "").upper()
+            is_complete = bool(run.get("is_complete_batch"))
+            if latest_root_status is None:
+                latest_root_status = status
+                if latest_root_status == "FAILED":
+                    recent_failed = True
+                elif latest_root_status == "FINISHED" and not is_complete:
+                    recent_incomplete = True
+            if status == "FINISHED" and is_complete:
+                recent_finished_count += 1
+        mlflow_available = bool(history.get("status")) and history.get("status") != "unavailable"
     except Exception:
         pass
 
@@ -785,28 +781,27 @@ def replay_health() -> dict[str, Any]:
         else:
             row_count = row_estimate
         stored_row_count = row_count
-        compatibility_latest_event_time = latest_event_time
-        compatibility_row_count = row_count
+        replay_progress_row_count = None
         if table_name == settings.us_prediction_table.split(".")[-1] and row_count == 0:
             latest_replay_row_index = None
             _clear_replay_progress_cache(table_name)
         if latest_replay_row_index is not None:
-            compatibility_row_count = latest_replay_row_index + 1
-            compatibility_latest_event_time = latest_insert_time or latest_event_time
+            replay_progress_row_count = latest_replay_row_index + 1
         total_rows += stored_row_count
         if table_name == settings.us_prediction_table.split(".")[-1]:
-            replay_rows = compatibility_row_count
+            replay_rows = stored_row_count
 
         source_health.append(
             {
                 "table": table_name,
-                "status": "ok" if compatibility_row_count else "not_enough_data",
-                "row_count": compatibility_row_count,
+                "status": "ok" if stored_row_count else "not_enough_data",
+                "row_count": stored_row_count,
                 "stored_row_count": stored_row_count,
+                "replay_progress_row_count": replay_progress_row_count,
                 "row_estimate": row_estimate,
                 "latest_event_time": (
-                    compatibility_latest_event_time.isoformat()
-                    if compatibility_latest_event_time
+                    (latest_event_time or latest_insert_time).isoformat()
+                    if (latest_event_time or latest_insert_time)
                     else None
                 ),
                 "latest_created_at": (
@@ -818,6 +813,9 @@ def replay_health() -> dict[str, Any]:
         )
 
     if not source_health:
+        schedule_interval_minutes = int(
+            os.getenv("AIRFLOW_MODEL_RETRAIN_INTERVAL_MINUTES", "60") or "60"
+        )
         return {
             "status": "unavailable",
             "row_count": 0,
@@ -831,9 +829,9 @@ def replay_health() -> dict[str, Any]:
                 "status": "continue",
                 "reason": "No source tables available yet.",
                 "latest_event_time": None,
-                "schedule_interval_minutes": 45,
-                "schedule_window_minutes": 45,
-                "idle_window_minutes": 135,
+                "schedule_interval_minutes": schedule_interval_minutes,
+                "schedule_window_minutes": schedule_interval_minutes,
+                "idle_window_minutes": schedule_interval_minutes * 3,
                 "mlflow_available": False,
                 "has_data": False,
                 "data_is_stale": False,

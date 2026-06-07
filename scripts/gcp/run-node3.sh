@@ -54,7 +54,8 @@ NODE3_CURRENT_BATCH_ID=""
 NODE3_SOURCE_WATERMARK=""
 NODE3_REMOTE_PENDING_MANIFEST_COUNT=0
 NODE3_INCREMENTAL_BATCH_LIMIT="${NODE3_DELTA_BATCH_MAX_FILES:-${SPARK_INCREMENTAL_MAX_FILES:-10000}}"
-NODE3_H2O_WALL_TIMEOUT_SECONDS="${NODE3_H2O_WALL_TIMEOUT_SECONDS:-3600}"
+NODE3_H2O_WALL_TIMEOUT_SECONDS="${NODE3_H2O_WALL_TIMEOUT_SECONDS:-3300}"
+NODE3_LOCAL_GOLD_INCREMENTAL_BATCH_RETENTION="${NODE3_LOCAL_GOLD_INCREMENTAL_BATCH_RETENTION:-1}"
 NODE3_STATUS_VALUE="failed"
 NODE3_STATUS_MESSAGE="Node 3 retrain did not complete."
 NODE3_STATUS_PHASE="initializing"
@@ -265,6 +266,52 @@ acquire_node3_lock() {
   fi
 
   echo "Detected a stale Node 3 lock. Removing it before continuing."
+  local active_worker_pid=""
+  active_worker_pid="$(python3 - "$$" "${PPID:-0}" <<'PY'
+import os
+import sys
+
+current_pid = int(sys.argv[1])
+parent_pid = int(sys.argv[2])
+run_targets = {
+    "scripts/gcp/run-node3.sh",
+    "/opt/traffic/scripts/gcp/run-node3.sh",
+}
+h2o_targets = {
+    "ml/training/h2o_after_2020.py",
+    "/opt/traffic/ml/training/h2o_after_2020.py",
+}
+
+for entry in sorted(os.listdir("/proc"), key=lambda value: int(value) if value.isdigit() else 0):
+    if not entry.isdigit():
+        continue
+    pid = int(entry)
+    if pid in {current_pid, parent_pid}:
+        continue
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        continue
+    if not raw:
+        continue
+    argv = [part.decode("utf-8", errors="ignore") for part in raw.split(b"\0") if part]
+    if not argv:
+        continue
+    argv0 = os.path.basename(argv[0])
+    if argv0 == "bash" and len(argv) >= 2 and argv[1] in run_targets:
+        print(pid)
+        raise SystemExit(0)
+    if argv0.startswith("python") and any(arg in h2o_targets for arg in argv[1:]):
+        print(pid)
+        raise SystemExit(0)
+PY
+)"
+  if [ -n "${active_worker_pid}" ] && kill -0 "${active_worker_pid}" 2>/dev/null; then
+    echo "Detected an active Node 3 retrain worker (PID ${active_worker_pid}) even though the lock looked stale. Exiting cleanly."
+    NODE3_LOCK_BUSY=1
+    exit "${NODE3_LOCK_BUSY_EXIT_CODE}"
+  fi
   rm -rf "${NODE3_LOCK_DIR}" 2>/dev/null || sudo rm -rf "${NODE3_LOCK_DIR}"
   if mkdir "${NODE3_LOCK_DIR}" 2>/dev/null; then
     echo "$$" > "${NODE3_LOCK_PID_FILE}"
@@ -324,6 +371,7 @@ done
 acquire_node3_lock
 echo "Node 3 execution lock acquired by PID $$."
 echo "NODE3_RUN_BATCH_PIPELINE: ${NODE3_RUN_BATCH_PIPELINE}"
+echo "$$" > "${NODE3_BACKGROUND_PID_FILE}"
 write_node3_status "continue" "starting" "Node 3 retrain job started and acquired the execution lock."
 write_node3_status "continue" "bootstrap" "Node 3 lock acquired. Preparing Spark and retrain runtime."
 
@@ -638,6 +686,45 @@ mark_silver_watermark_processed() {
   echo "Recorded the Silver watermark for the successful retrain."
 }
 
+prune_local_silver_snapshot() {
+  if [ ! -s "${NODE3_LAST_SUCCESSFUL_SILVER_WATERMARK_FILE}" ]; then
+    echo "No successful Silver watermark exists yet. Keeping the full local Silver snapshot."
+    return 0
+  fi
+
+  python3 - "${LOCAL_SILVER_FEATURES_PATH}" "${NODE3_LAST_SUCCESSFUL_SILVER_WATERMARK_FILE}" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+local_root = Path(sys.argv[1])
+watermark_path = Path(sys.argv[2])
+
+if not local_root.exists() or not watermark_path.exists():
+    raise SystemExit(0)
+
+watermark = watermark_path.read_text(encoding="utf-8").strip()
+if not watermark:
+    raise SystemExit(0)
+
+pattern = re.compile(r"features-(\d{8}T\d+Z)\.jsonl$")
+removed = 0
+for path in local_root.rglob("features-*.jsonl"):
+    match = pattern.match(path.name)
+    if not match:
+        continue
+    stamp = match.group(1)
+    if stamp <= watermark:
+        try:
+            path.unlink()
+            removed += 1
+        except FileNotFoundError:
+            continue
+
+print(f"Pruned {removed} local Silver feature files at or before watermark {watermark}.")
+PY
+}
+
 stop_stale_h2o_processes() {
   local stale_h2o_pids
   stale_h2o_pids="$(pgrep -f 'h2o\\.jar' || true)"
@@ -682,6 +769,41 @@ bootstrap_local_gold_snapshot() {
   else
     echo "No existing Gold Parquet snapshot was found in GCS. The next Spark run will rebuild Gold from the full Silver snapshot."
   fi
+}
+
+prune_local_gold_incremental_history() {
+  local retention_count="${NODE3_LOCAL_GOLD_INCREMENTAL_BATCH_RETENTION}"
+  if ! [[ "${retention_count}" =~ ^[0-9]+$ ]]; then
+    retention_count=1
+  fi
+
+  python3 - "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}" "${LOCAL_GOLD_RETRAIN_CSV_PATH}" "${retention_count}" <<'PY'
+import re
+import shutil
+import sys
+from pathlib import Path
+
+roots = [Path(sys.argv[1]), Path(sys.argv[2])]
+retention = max(0, int(sys.argv[3]))
+pattern = re.compile(r"^\d{8}T\d+Z$")
+
+for root in roots:
+    incremental_root = root / "incremental_batches"
+    if not incremental_root.is_dir():
+        continue
+    batch_dirs = sorted(
+        [
+            path
+            for path in incremental_root.iterdir()
+            if path.is_dir() and pattern.match(path.name)
+        ],
+        key=lambda path: path.name,
+    )
+    to_delete = batch_dirs[:-retention] if retention > 0 else batch_dirs
+    for path in to_delete:
+        print(f"Pruning local incremental Gold batch: {path}")
+        shutil.rmtree(path, ignore_errors=True)
+PY
 }
 
 sync_silver_snapshot() {
@@ -981,6 +1103,7 @@ echo "Local Silver snapshot is ready. Sample file: ${LOCAL_SILVER_SAMPLE_FILE}"
 
 echo "Preparing local Spark output directories with container-writable permissions."
 bootstrap_local_gold_snapshot
+prune_local_gold_incremental_history
 ensure_path_writable "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}"
 ensure_path_writable "${LOCAL_GOLD_RETRAIN_CSV_PATH}"
 ensure_path_writable "${LOCAL_CLOUD_DATA_DIR}"
@@ -1023,13 +1146,14 @@ compose_cmd \
   GOLD_RETRAIN_CSV_PATH=/data/cloud/gold/features/retrain/csv \
   SPARK_INCREMENTAL_MAX_FILES="${SPARK_INCREMENTAL_MAX_FILES:-10000}" \
   /opt/spark/bin/spark-submit \
-  --master spark://spark-master:7077 \
-  --driver-memory "${SPARK_DRIVER_MEMORY:-1536m}" \
-  /opt/traffic/processing/spark_batch.py
+    --master spark://spark-master:7077 \
+    --driver-memory "${SPARK_DRIVER_MEMORY:-1536m}" \
+    /opt/traffic/processing/spark_batch.py
 
 echo "Syncing Gold Parquet and CSV outputs back to GCS."
 gcloud storage rsync -r "${LOCAL_GOLD_RETRAIN_PARQUET_PATH}" "${GOLD_RETRAIN_PARQUET_PATH}"
 gcloud storage rsync -r "${LOCAL_GOLD_RETRAIN_CSV_PATH}" "${GOLD_RETRAIN_CSV_PATH}"
+prune_local_gold_incremental_history
 stop_node3_status_heartbeat
 stop_spark_services_for_h2o
 
@@ -1167,6 +1291,7 @@ fi
 NODE3_STATUS_MODELS_LOGGED="${NODE3_H2O_TOP_K_MODELS:-${H2O_TOP_K_MODELS:-10}}"
 
 mark_silver_watermark_processed
+prune_local_silver_snapshot
 write_node3_status "continue" "completed" "Spark and H2O retraining completed successfully. Waiting for the next schedule tick." "${NODE3_CURRENT_BATCH_ID}" "${NODE3_STATUS_MODELS_LOGGED}"
 
 echo "Node 3 services:"

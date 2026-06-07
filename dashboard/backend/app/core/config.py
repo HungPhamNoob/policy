@@ -54,11 +54,11 @@ class Settings(BaseSettings):
         alias="GOLD_RETRAIN_PATH",
     )
     airflow_model_retrain_schedule: str = Field(
-        default="*/45 * * * *",
+        default="0 * * * *",
         alias="AIRFLOW_MODEL_RETRAIN_SCHEDULE",
     )
     airflow_model_retrain_interval_minutes: int = Field(
-        default=45,
+        default=60,
         alias="AIRFLOW_MODEL_RETRAIN_INTERVAL_MINUTES",
     )
     airflow_stream_health_schedule: str = Field(

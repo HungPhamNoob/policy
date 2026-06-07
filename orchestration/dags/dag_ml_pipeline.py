@@ -3,7 +3,7 @@
 orchestration/dags/dag_ml_pipeline.py
 Airflow DAG: model_retrain_hourly
 
-Triggers the US accident severity model retraining pipeline every 45 minutes.
+Triggers the US accident severity model retraining pipeline every 60 minutes.
 Uses internal SSH to launch run-node3.sh on node3-batch (10.128.0.8) in the
 background, then reads Node 3's status file.
 """
@@ -24,15 +24,15 @@ default_args = {
 }
 
 RETRAIN_INTERVAL_MINUTES = int(
-    os.getenv("AIRFLOW_MODEL_RETRAIN_INTERVAL_MINUTES", "45")
+    os.getenv("AIRFLOW_MODEL_RETRAIN_INTERVAL_MINUTES", "60")
 )
 
 with DAG(
     dag_id="model_retrain_hourly",
     default_args=default_args,
-    description="H2O AutoML retraining every 45 min via internal SSH",
-    # Use a real 45-minute cadence between scheduled runs. Cron `*/45 * * * *`
-    # only hits minute 0 and 45, which produces uneven 45/15 gaps in Airflow.
+    description="H2O AutoML retraining every 60 min via internal SSH",
+    # Use a real 60-minute cadence between scheduled runs so the next tick
+    # waits for a full interval instead of depending on a cron string.
     schedule_interval=timedelta(minutes=RETRAIN_INTERVAL_MINUTES),
     start_date=datetime(2026, 5, 1),
     catchup=False,
@@ -48,17 +48,34 @@ with DAG(
             SSH_KEY_PATH="${SSH_KEY:-/opt/airflow/.ssh/traffic-inter-node.key}"
             SSH_USER="${HUNG_SSH_USER:-runner}"
             NODE3_IP="${NODE3_INTERNAL_IP:-10.128.0.8}"
-            for candidate in \
+            resolve_ssh_key() {
+                local candidate
+                for candidate in "$@"; do
+                    if [ -f "${candidate}" ] && [ -r "${candidate}" ]; then
+                        printf '%s\n' "${candidate}"
+                        return 0
+                    fi
+                    if [ -d "${candidate}" ]; then
+                        local discovered
+                        discovered="$(find "${candidate}" -maxdepth 2 -type f -readable | head -n 1 || true)"
+                        if [ -n "${discovered}" ]; then
+                            printf '%s\n' "${discovered}"
+                            return 0
+                        fi
+                    fi
+                done
+                return 1
+            }
+            RESOLVED_SSH_KEY="$(resolve_ssh_key \
                 "${SSH_KEY_PATH}" \
                 "/opt/airflow/.ssh/traffic-inter-node.key" \
                 "/run/secrets/google_compute_engine/traffic-inter-node.key" \
                 "/run/secrets/google_compute_engine/google_compute_engine" \
-                "/run/secrets/google_compute_engine"; do
-                if [ -f "${candidate}" ]; then
-                    SSH_KEY_PATH="${candidate}"
-                    break
-                fi
-            done
+                "/run/secrets/google_compute_engine" \
+                "/run/secrets")" || true
+            if [ -n "${RESOLVED_SSH_KEY}" ]; then
+                SSH_KEY_PATH="${RESOLVED_SSH_KEY}"
+            fi
             echo "Node3 target: ${SSH_USER}@${NODE3_IP}"
             echo "SSH key path: ${SSH_KEY_PATH}"
 
@@ -94,17 +111,34 @@ with DAG(
             SSH_KEY_PATH="${SSH_KEY:-/opt/airflow/.ssh/traffic-inter-node.key}"
             SSH_USER="${HUNG_SSH_USER:-runner}"
             NODE3_IP="${NODE3_INTERNAL_IP:-10.128.0.8}"
-            for candidate in \
+            resolve_ssh_key() {
+                local candidate
+                for candidate in "$@"; do
+                    if [ -f "${candidate}" ] && [ -r "${candidate}" ]; then
+                        printf '%s\n' "${candidate}"
+                        return 0
+                    fi
+                    if [ -d "${candidate}" ]; then
+                        local discovered
+                        discovered="$(find "${candidate}" -maxdepth 2 -type f -readable | head -n 1 || true)"
+                        if [ -n "${discovered}" ]; then
+                            printf '%s\n' "${discovered}"
+                            return 0
+                        fi
+                    fi
+                done
+                return 1
+            }
+            RESOLVED_SSH_KEY="$(resolve_ssh_key \
                 "${SSH_KEY_PATH}" \
                 "/opt/airflow/.ssh/traffic-inter-node.key" \
                 "/run/secrets/google_compute_engine/traffic-inter-node.key" \
                 "/run/secrets/google_compute_engine/google_compute_engine" \
-                "/run/secrets/google_compute_engine"; do
-                if [ -f "${candidate}" ]; then
-                    SSH_KEY_PATH="${candidate}"
-                    break
-                fi
-            done
+                "/run/secrets/google_compute_engine" \
+                "/run/secrets")" || true
+            if [ -n "${RESOLVED_SSH_KEY}" ]; then
+                SSH_KEY_PATH="${RESOLVED_SSH_KEY}"
+            fi
 
             if [ ! -f "${SSH_KEY_PATH}" ] || [ ! -r "${SSH_KEY_PATH}" ]; then
                 echo "ERROR: SSH key is unavailable or unreadable at ${SSH_KEY_PATH}. Cannot inspect Node3 retrain status."
