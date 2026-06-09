@@ -18,6 +18,10 @@ NODE2_REFRESH_US_PRODUCERS="${NODE2_REFRESH_US_PRODUCERS:-false}"
 NODE2_DISK_PRESSURE_THRESHOLD="${NODE2_DISK_PRESSURE_THRESHOLD:-85}"
 NODE2_LOG_TRUNCATE_MB="${NODE2_LOG_TRUNCATE_MB:-200}"
 NODE2_MANAGED_NAME_PATTERN='^node2-(zookeeper|kafka-1|kafka-2|kafka-3|kafka-topic-init|producer-0|producer-1|producer-2|tomtom-producer|tomtom-live-consumer|flink-jm|flink-tm|redis|flink-python-job)$'
+ML_MODEL_NAME="${ML_MODEL_NAME:-traffic-risk-model}"
+ALLOW_US_REPLAY_BEFORE_OFFLINE_TRAIN="${ALLOW_US_REPLAY_BEFORE_OFFLINE_TRAIN:-false}"
+OFFLINE_MLFLOW_EXPERIMENT_NAME="${OFFLINE_MLFLOW_EXPERIMENT_NAME:-traffic-risk-assessment}"
+OFFLINE_MLFLOW_RUN_NAME="${OFFLINE_MLFLOW_RUN_NAME:-h2o_automl}"
 APT_CACHE_UPDATED=0
 
 echo "Node 2 run script started at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -237,6 +241,75 @@ PY
   echo "${resume_row}"
 }
 
+offline_model_ready() {
+  if [ "${ALLOW_US_REPLAY_BEFORE_OFFLINE_TRAIN}" = "true" ]; then
+    return 0
+  fi
+
+  if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+    echo "curl/python3 is missing; replay gate cannot verify offline MLflow training yet."
+    return 1
+  fi
+
+  local tracking_uri="${MLFLOW_TRACKING_URI:-http://${NODE1_INTERNAL_IP:-10.128.0.12}:5000}"
+  local api_base="${tracking_uri%/}/api/2.0/mlflow"
+  local experiment_name="${OFFLINE_MLFLOW_EXPERIMENT_NAME}"
+  local run_name="${OFFLINE_MLFLOW_RUN_NAME}"
+
+  if TRACKING_URI="${tracking_uri}" API_BASE="${api_base}" EXPERIMENT_NAME="${experiment_name}" RUN_NAME="${run_name}" \
+    python3 - <<'PY'
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+api_base = os.environ["API_BASE"].rstrip("/")
+experiment_name = os.environ["EXPERIMENT_NAME"]
+run_name = os.environ["RUN_NAME"]
+
+try:
+    experiment_url = (
+        f"{api_base}/experiments/get-by-name?experiment_name="
+        f"{urllib.parse.quote(experiment_name, safe='')}"
+    )
+    with urllib.request.urlopen(experiment_url, timeout=10) as response:
+        experiment_payload = json.load(response)
+    experiment_id = experiment_payload["experiment"]["experiment_id"]
+
+    body = json.dumps(
+        {
+            "experiment_ids": [experiment_id],
+            "filter": (
+                f"attributes.run_name = '{run_name}' "
+                "and attributes.status = 'FINISHED'"
+            ),
+            "max_results": 1,
+            "order_by": ["attributes.start_time DESC"],
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{api_base}/runs/search",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        runs_payload = json.load(response)
+
+    sys.exit(0 if (runs_payload.get("runs") or []) else 1)
+except Exception:
+    sys.exit(1)
+PY
+  then
+    return 0
+  fi
+
+  echo "US replay is gated until offline MLflow run '${run_name}' finishes in experiment '${experiment_name}'."
+  echo "Checked: ${api_base}/experiments/get-by-name + runs/search"
+  return 1
+}
+
 ensure_us_replay_producers() {
   local missing_services=()
   local service_name
@@ -253,6 +326,12 @@ ensure_us_replay_producers() {
       missing_services+=("${service_name}")
     fi
   done
+
+  if ! offline_model_ready; then
+    echo "Stopping any running US replay producers until the offline model is ready."
+    docker stop node2-producer-0 node2-producer-1 node2-producer-2 >/dev/null 2>&1 || true
+    return 0
+  fi
 
   if [ "${NODE2_REFRESH_US_PRODUCERS}" = "true" ]; then
     echo "Refreshing US replay producers because NODE2_REFRESH_US_PRODUCERS=true."

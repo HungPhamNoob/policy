@@ -4,25 +4,78 @@
 
 set -euo pipefail
 
-PROJECT_ID="${GCP_PROJECT_ID:-big-data-group-4}"
+PROJECT_ID="${GCP_PROJECT_ID:-bigdata1-490302}"
 ZONE="${GCP_ZONE:-us-central1-a}"
 NODE1="${NODE1:-node1-control}"
 NODE2="${NODE2:-node2-streaming}"
 
-US_REPLAY_THROTTLE_SECONDS="${US_REPLAY_THROTTLE_SECONDS:-0.072}"
+US_REPLAY_THROTTLE_SECONDS="${US_REPLAY_THROTTLE_SECONDS:-0.068}"
 US_REPLAY_LOOP_FOREVER="${US_REPLAY_LOOP_FOREVER:-false}"
 US_REPLAY_START_ROW="${US_REPLAY_START_ROW:-0}"
+OFFLINE_MLFLOW_EXPERIMENT_NAME="${OFFLINE_MLFLOW_EXPERIMENT_NAME:-traffic-risk-assessment}"
+OFFLINE_MLFLOW_RUN_NAME="${OFFLINE_MLFLOW_RUN_NAME:-h2o_automl}"
 POSTGRES_TABLE="${POSTGRES_US_PREDICTION_TABLE:-traffic_risk_predictions}"
 KAFKA_TOPIC_RAW="${KAFKA_TOPIC_RAW:-traffic.us.raw}"
 KAFKA_REPLICATION_FACTOR="${KAFKA_REPLICATION_FACTOR:-3}"
 KAFKA_PARTITIONS="${KAFKA_PARTITIONS:-3}"
-FLINK_CHECKPOINT_DIR="${FLINK_CHECKPOINT_DIR:-gs://big-data-group-4-backups/checkpoints/flink}"
+FLINK_CHECKPOINT_DIR="${FLINK_CHECKPOINT_DIR:-gs://bigdata1-490302-backups/checkpoints/flink}"
 
 echo "=============================================="
 echo "US Replay Only Reset - $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "=============================================="
 echo "Replay throttle: ${US_REPLAY_THROTTLE_SECONDS}s"
 echo "Replay loop forever: ${US_REPLAY_LOOP_FOREVER}"
+
+echo ""
+echo "Pre-check: US replay only starts after offline training fully finishes..."
+if ! gcloud compute ssh "${NODE1}" --project="${PROJECT_ID}" --zone="${ZONE}" --command="
+  OFFLINE_MLFLOW_EXPERIMENT_NAME='${OFFLINE_MLFLOW_EXPERIMENT_NAME}' \
+  OFFLINE_MLFLOW_RUN_NAME='${OFFLINE_MLFLOW_RUN_NAME}' \
+  python3 - <<'PY'
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+api_base = 'http://localhost:5000/api/2.0/mlflow'
+experiment_name = os.environ['OFFLINE_MLFLOW_EXPERIMENT_NAME']
+run_name = os.environ['OFFLINE_MLFLOW_RUN_NAME']
+
+experiment_url = (
+    f\"{api_base}/experiments/get-by-name?experiment_name=\"
+    f\"{urllib.parse.quote(experiment_name, safe='')}\"
+)
+with urllib.request.urlopen(experiment_url, timeout=10) as response:
+    experiment_payload = json.load(response)
+experiment_id = experiment_payload['experiment']['experiment_id']
+
+body = json.dumps(
+    {
+        'experiment_ids': [experiment_id],
+        'filter': (
+            f\"attributes.run_name = '{run_name}' \"
+            \"and attributes.status = 'FINISHED'\"
+        ),
+        'max_results': 1,
+        'order_by': ['attributes.start_time DESC'],
+    }
+).encode('utf-8')
+request = urllib.request.Request(
+    f'{api_base}/runs/search',
+    data=body,
+    headers={'Content-Type': 'application/json'},
+    method='POST',
+)
+with urllib.request.urlopen(request, timeout=15) as response:
+    runs_payload = json.load(response)
+
+sys.exit(0 if (runs_payload.get('runs') or []) else 1)
+PY
+"; then
+  echo "Offline run '${OFFLINE_MLFLOW_RUN_NAME}' is not FINISHED in MLflow yet. Leaving US replay stopped."
+  exit 0
+fi
 
 echo ""
 echo "Step 1: Pause retrain DAG during the replay reset window..."
