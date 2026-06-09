@@ -14,6 +14,7 @@ PROJECT_ROOT="${PROJECT_ROOT:-/opt/traffic}"
 ENV_FILE="${ENV_FILE:-${PROJECT_ROOT}/.env.cloud}"
 NODE1_COMPOSE_FILE="${PROJECT_ROOT}/deployment/node1-control/docker-compose.yaml"
 NODE1_COMPOSE_DIR="$(dirname "${NODE1_COMPOSE_FILE}")"
+RUNTIME_HOME="${HOME:-$(getent passwd "$(whoami)" | cut -d: -f6 2>/dev/null || printf '/home/%s' "$(whoami)")}"
 TRAINING_PID_FILE="${PROJECT_ROOT}/logs/cloud_h2o_before_2020.pid"
 TRAINING_TMP_CLEANUP_HOURS="${TRAINING_TMP_CLEANUP_HOURS:-12}"
 NODE1_BOOTSTRAP_MODEL="${NODE1_BOOTSTRAP_MODEL:-true}"
@@ -124,10 +125,10 @@ ensure_gcloud_cli() {
   echo "Installing missing dependency for 'gcloud': google-cloud-cli tarball"
   local installer_tgz="/tmp/google-cloud-cli-460.0.0-linux-x86_64.tar.gz"
   curl -fsSL "https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-460.0.0-linux-x86_64.tar.gz" -o "${installer_tgz}"
-  rm -rf "${HOME}/google-cloud-sdk"
-  tar -xf "${installer_tgz}" -C "${HOME}"
-  "${HOME}/google-cloud-sdk/install.sh" --quiet
-  export PATH="${PATH}:${HOME}/google-cloud-sdk/bin"
+  rm -rf "${RUNTIME_HOME}/google-cloud-sdk"
+  tar -xf "${installer_tgz}" -C "${RUNTIME_HOME}"
+  "${RUNTIME_HOME}/google-cloud-sdk/install.sh" --quiet
+  export PATH="${PATH}:${RUNTIME_HOME}/google-cloud-sdk/bin"
 }
 
 sync_runtime_env_to_gcs() {
@@ -136,7 +137,9 @@ sync_runtime_env_to_gcs() {
     return 0
   fi
   echo "Uploading ${ENV_FILE} to ${gcs_env_path} so the other nodes can refresh their runtime env."
-  gcloud storage cp "${ENV_FILE}" "${gcs_env_path}" >/dev/null
+  if ! gcloud storage cp "${ENV_FILE}" "${gcs_env_path}" >/dev/null 2>&1; then
+    echo "WARNING: Failed to sync ${ENV_FILE} to ${gcs_env_path}; continuing with local runtime env."
+  fi
 }
 
 ensure_ssh_key_mount_source() {
@@ -178,7 +181,7 @@ ensure_ssh_key_mount_source() {
   if [ -n "${configured_path}" ]; then
     candidate_paths+=("${configured_path}")
   fi
-  candidate_paths+=("${HOME}/.ssh/google_compute_engine")
+  candidate_paths+=("${RUNTIME_HOME}/.ssh/google_compute_engine")
   candidate_paths+=("/home/${target_user}/.ssh/google_compute_engine")
   candidate_paths+=("${PROJECT_ROOT}/secrets/inter_node_google_compute_engine")
 
@@ -453,6 +456,30 @@ run_offline_training() {
   local exit_code=0
   local training_venv="${PROJECT_ROOT}/.venv-node1"
   local training_python="${training_venv}/bin/python"
+  local effective_h2o_nthreads="${H2O_NTHREADS:-2}"
+  local cpu_count="2"
+  local reserved_service_cores=1
+  local max_safe_h2o_nthreads=1
+  local training_cmd=("${training_python}" "ml/training/h2o_before_2020.py")
+
+  if command -v nproc >/dev/null 2>&1; then
+    cpu_count="$(nproc)"
+  fi
+  if [[ "${cpu_count}" =~ ^[0-9]+$ ]]; then
+    max_safe_h2o_nthreads=$((cpu_count - reserved_service_cores))
+    if [ "${max_safe_h2o_nthreads}" -lt 1 ]; then
+      max_safe_h2o_nthreads=1
+    fi
+  fi
+  if [[ "${effective_h2o_nthreads}" =~ ^[0-9]+$ ]] && [ "${effective_h2o_nthreads}" -gt "${max_safe_h2o_nthreads}" ]; then
+    echo "Reducing H2O_NTHREADS from ${effective_h2o_nthreads} to ${max_safe_h2o_nthreads} on node1 so dashboard services keep CPU headroom."
+    effective_h2o_nthreads="${max_safe_h2o_nthreads}"
+  fi
+  if command -v ionice >/dev/null 2>&1; then
+    training_cmd=("ionice" "-c2" "-n7" "nice" "-n" "10" "${training_cmd[@]}")
+  elif command -v nice >/dev/null 2>&1; then
+    training_cmd=("nice" "-n" "10" "${training_cmd[@]}")
+  fi
   {
     if [ ! -x "${training_python}" ]; then
       python3 -m venv "${training_venv}"
@@ -499,7 +526,7 @@ run_offline_training() {
     else
       echo "US_TRAIN_OFFLINE_PATH is a GCS feature CSV. Skipping local feature generation."
     fi
-    "${training_python}" ml/training/h2o_before_2020.py
+    H2O_NTHREADS="${effective_h2o_nthreads}" "${training_cmd[@]}"
   } || exit_code=$?
 
   clear_training_active
