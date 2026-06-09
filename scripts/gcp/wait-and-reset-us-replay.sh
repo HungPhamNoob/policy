@@ -8,6 +8,7 @@ PROJECT_ROOT="${PROJECT_ROOT:-/home/hung/YEAR 3/Big Data/BTL}"
 LOG_FILE="${LOG_FILE:-/tmp/us-replay-reset-after-retrain.log}"
 PROJECT_ID="${GCP_PROJECT_ID:-bigdata1-490302}"
 ZONE="${GCP_ZONE:-us-central1-a}"
+SSH_TIMEOUT_SECONDS="${SSH_TIMEOUT_SECONDS:-45}"
 # Keep the post-reset replay pace close to the cloud default so the
 # 2020+ replay dataset drains in about one day while the rest of the stack
 # stays responsive.
@@ -20,7 +21,8 @@ cd "${PROJECT_ROOT}"
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] waiting for current node3 retrain to finish" >> "${LOG_FILE}"
 while true; do
-  if gcloud compute ssh node3-batch \
+  if timeout "${SSH_TIMEOUT_SECONDS}" \
+      gcloud compute ssh node3-batch \
       --quiet \
       --zone="${ZONE}" \
       --project="${PROJECT_ID}" \
@@ -33,7 +35,8 @@ while true; do
 
   # If SSH fails transiently, keep waiting; if it succeeds and the process is
   # absent, the loop should break and trigger the reset.
-  if gcloud compute ssh node3-batch \
+  if timeout "${SSH_TIMEOUT_SECONDS}" \
+      gcloud compute ssh node3-batch \
       --quiet \
       --zone="${ZONE}" \
       --project="${PROJECT_ID}" \
@@ -48,7 +51,8 @@ done
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] node3 retrain idle; now waiting for offline bootstrap completion" >> "${LOG_FILE}"
 while true; do
-  if gcloud compute ssh node1-control \
+  if timeout "${SSH_TIMEOUT_SECONDS}" \
+      gcloud compute ssh node1-control \
       --quiet \
       --zone="${ZONE}" \
       --project="${PROJECT_ID}" \
@@ -98,7 +102,7 @@ PY
     break
   fi
 
-  echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] offline bootstrap still running or unavailable; retrying in 60s" >> "${LOG_FILE}"
+  echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] offline bootstrap still running, unavailable, or SSH timed out; retrying in 60s" >> "${LOG_FILE}"
   sleep 60
 done
 
